@@ -22,17 +22,26 @@ from mypy.errors import Errors
 from mypy.types import (
     Type, CallableType, Instance, TypeVarType, TupleType, TypedDictType, LiteralType,
     UnionType, NoneType, AnyType, Overloaded, FunctionLike, DeletedType, TypeType,
-    UninhabitedType, TypeOfAny, ForwardRef, UnboundType, PartialType,
+    UninhabitedType, TypeOfAny, UnboundType, PartialType, get_proper_type, ProperType,
+    get_proper_types
 )
 from mypy.typetraverser import TypeTraverserVisitor
 from mypy.nodes import (
-    TypeInfo, Context, MypyFile, op_methods, FuncDef, reverse_builtin_aliases,
+    TypeInfo, Context, MypyFile, op_methods, op_methods_to_symbols,
+    FuncDef, reverse_builtin_aliases,
     ARG_POS, ARG_OPT, ARG_NAMED, ARG_NAMED_OPT, ARG_STAR, ARG_STAR2,
     ReturnStmt, NameExpr, Var, CONTRAVARIANT, COVARIANT, SymbolNode,
-    CallExpr
+    CallExpr, SymbolTable
 )
+from mypy.subtypes import (
+    is_subtype, find_member, get_member_flags,
+    IS_SETTABLE, IS_CLASSVAR, IS_CLASS_OR_STATIC,
+)
+from mypy.sametypes import is_same_type
 from mypy.util import unmangle
-from mypy import message_registry
+from mypy.errorcodes import ErrorCode
+from mypy import message_registry, errorcodes as codes
+
 
 ARG_CONSTRUCTOR_NAMES = {
     ARG_POS: "Arg",
@@ -41,6 +50,23 @@ ARG_CONSTRUCTOR_NAMES = {
     ARG_NAMED_OPT: "DefaultNamedArg",
     ARG_STAR: "VarArg",
     ARG_STAR2: "KwArg",
+}  # type: Final
+
+
+# Map from the full name of a missing definition to the test fixture (under
+# test-data/unit/fixtures/) that provides the definition. This is used for
+# generating better error messages when running mypy tests only.
+SUGGESTED_TEST_FIXTURES = {
+    'builtins.list': 'list.pyi',
+    'builtins.dict': 'dict.pyi',
+    'builtins.set': 'set.pyi',
+    'builtins.tuple': 'tuple.pyi',
+    'builtins.bool': 'bool.pyi',
+    'builtins.Exception': 'exception.pyi',
+    'builtins.BaseException': 'exception.pyi',
+    'builtins.isinstance': 'isinstancelist.pyi',
+    'builtins.property': 'property.pyi',
+    'builtins.classmethod': 'classmethod.pyi',
 }  # type: Final
 
 
@@ -104,8 +130,14 @@ class MessageBuilder:
     def is_errors(self) -> bool:
         return self.errors.is_errors()
 
-    def report(self, msg: str, context: Optional[Context], severity: str,
-               file: Optional[str] = None, origin: Optional[Context] = None,
+    def report(self,
+               msg: str,
+               context: Optional[Context],
+               severity: str,
+               *,
+               code: Optional[ErrorCode] = None,
+               file: Optional[str] = None,
+               origin: Optional[Context] = None,
                offset: int = 0) -> None:
         """Report an error or note (unless disabled)."""
         if origin is not None:
@@ -119,25 +151,38 @@ class MessageBuilder:
                                context.get_column() if context else -1,
                                msg, severity=severity, file=file, offset=offset,
                                origin_line=origin.get_line() if origin else None,
-                               end_line=end_line)
+                               end_line=end_line,
+                               code=code)
 
-    def fail(self, msg: str, context: Optional[Context], file: Optional[str] = None,
+    def fail(self,
+             msg: str,
+             context: Optional[Context],
+             *,
+             code: Optional[ErrorCode] = None,
+             file: Optional[str] = None,
              origin: Optional[Context] = None) -> None:
         """Report an error message (unless disabled)."""
-        self.report(msg, context, 'error', file=file, origin=origin)
+        self.report(msg, context, 'error', code=code, file=file, origin=origin)
 
-    def note(self, msg: str, context: Context, file: Optional[str] = None,
-             origin: Optional[Context] = None, offset: int = 0) -> None:
+    def note(self,
+             msg: str,
+             context: Context,
+             file: Optional[str] = None,
+             origin: Optional[Context] = None,
+             offset: int = 0,
+             *,
+             code: Optional[ErrorCode] = None) -> None:
         """Report a note (unless disabled)."""
         self.report(msg, context, 'note', file=file, origin=origin,
-                    offset=offset)
+                    offset=offset, code=code)
 
     def note_multiline(self, messages: str, context: Context, file: Optional[str] = None,
-                       origin: Optional[Context] = None, offset: int = 0) -> None:
+                       origin: Optional[Context] = None, offset: int = 0,
+                       code: Optional[ErrorCode] = None) -> None:
         """Report as many notes as lines in the message (unless disabled)."""
         for msg in messages.splitlines():
             self.report(msg, context, 'note', file=file, origin=origin,
-                        offset=offset)
+                        offset=offset, code=code)
 
     #
     # Specific operations
@@ -147,7 +192,12 @@ class MessageBuilder:
     # get some information as arguments, and they build an error message based
     # on them.
 
-    def has_no_attr(self, original_type: Type, typ: Type, member: str, context: Context) -> Type:
+    def has_no_attr(self,
+                    original_type: Type,
+                    typ: Type,
+                    member: str,
+                    context: Context,
+                    module_symbol_table: Optional[SymbolTable] = None) -> Type:
         """Report a missing or non-accessible member.
 
         original_type is the top-level type on which the error occurred.
@@ -156,15 +206,23 @@ class MessageBuilder:
         will be the specific item in the union that does not have the member
         attribute.
 
+        'module_symbol_table' is passed to this function if the type for which we
+        are trying to get a member was originally a module. The SymbolTable allows
+        us to look up and suggests attributes of the module since they are not
+        directly available on original_type
+
         If member corresponds to an operator, use the corresponding operator
         name in the messages. Return type Any.
         """
+        original_type = get_proper_type(original_type)
+        typ = get_proper_type(typ)
+
         if (isinstance(original_type, Instance) and
                 original_type.type.has_readable_member(member)):
             self.fail('Member "{}" is not assignable'.format(member), context)
         elif member == '__contains__':
             self.fail('Unsupported right operand type for in ({})'.format(
-                format_type(original_type)), context)
+                format_type(original_type)), context, code=codes.OPERATOR)
         elif member in op_methods.values():
             # Access to a binary operator member (e.g. _add). This case does
             # not handle indexing operations.
@@ -174,13 +232,13 @@ class MessageBuilder:
                     break
         elif member == '__neg__':
             self.fail('Unsupported operand type for unary - ({})'.format(
-                format_type(original_type)), context)
+                format_type(original_type)), context, code=codes.OPERATOR)
         elif member == '__pos__':
             self.fail('Unsupported operand type for unary + ({})'.format(
-                format_type(original_type)), context)
+                format_type(original_type)), context, code=codes.OPERATOR)
         elif member == '__invert__':
             self.fail('Unsupported operand type for ~ ({})'.format(
-                format_type(original_type)), context)
+                format_type(original_type)), context, code=codes.OPERATOR)
         elif member == '__getitem__':
             # Indexed get.
             # TODO: Fix this consistently in format_type
@@ -189,18 +247,19 @@ class MessageBuilder:
                     format_type(original_type)), context)
             else:
                 self.fail('Value of type {} is not indexable'.format(
-                    format_type(original_type)), context)
+                    format_type(original_type)), context, code=codes.INDEX)
         elif member == '__setitem__':
             # Indexed set.
-            self.fail('Unsupported target for indexed assignment', context)
+            self.fail('Unsupported target for indexed assignment', context, code=codes.INDEX)
         elif member == '__call__':
             if isinstance(original_type, Instance) and \
-                    (original_type.type.fullname() == 'builtins.function'):
+                    (original_type.type.fullname == 'builtins.function'):
                 # "'function' not callable" is a confusing error message.
                 # Explain that the problem is that the type of the function is not known.
-                self.fail('Cannot call function of unknown type', context)
+                self.fail('Cannot call function of unknown type', context, code=codes.OPERATOR)
             else:
-                self.fail('{} not callable'.format(format_type(original_type)), context)
+                self.fail('{} not callable'.format(format_type(original_type)), context,
+                          code=codes.OPERATOR)
         else:
             # The non-special case: a missing ordinary attribute.
             extra = ''
@@ -212,6 +271,15 @@ class MessageBuilder:
                 failed = False
                 if isinstance(original_type, Instance) and original_type.type.names:
                     alternatives = set(original_type.type.names.keys())
+
+                    if module_symbol_table is not None:
+                        alternatives |= {key for key in module_symbol_table.keys()}
+
+                    # in some situations, the member is in the alternatives set
+                    # but since we're in this function, we shouldn't suggest it
+                    if member in alternatives:
+                        alternatives.remove(member)
+
                     matches = [m for m in COMMON_MISTAKES.get(member, []) if m in alternatives]
                     matches.extend(best_matches(member, alternatives)[:3])
                     if member == '__aiter__' and matches == ['__iter__']:
@@ -220,13 +288,18 @@ class MessageBuilder:
                         # TODO: Handle differences in division between Python 2 and 3 more cleanly
                         matches = []
                     if matches:
-                        self.fail('{} has no attribute "{}"; maybe {}?{}'.format(
-                            format_type(original_type), member, pretty_or(matches), extra),
-                            context)
+                        self.fail(
+                            '{} has no attribute "{}"; maybe {}?{}'.format(
+                                format_type(original_type), member, pretty_or(matches), extra),
+                            context,
+                            code=codes.ATTR_DEFINED)
                         failed = True
                 if not failed:
-                    self.fail('{} has no attribute "{}"{}'.format(format_type(original_type),
-                                                                  member, extra), context)
+                    self.fail(
+                        '{} has no attribute "{}"{}'.format(
+                            format_type(original_type), member, extra),
+                        context,
+                        code=codes.ATTR_DEFINED)
             elif isinstance(original_type, UnionType):
                 # The checker passes "object" in lieu of "None" for attribute
                 # checks, so we manually convert it back.
@@ -235,11 +308,17 @@ class MessageBuilder:
                         any(type(item) == NoneType for item in original_type.items):
                     typ_format = '"None"'
                 self.fail('Item {} of {} has no attribute "{}"{}'.format(
-                    typ_format, orig_type_format, member, extra), context)
+                    typ_format, orig_type_format, member, extra), context,
+                    code=codes.UNION_ATTR)
         return AnyType(TypeOfAny.from_error)
 
-    def unsupported_operand_types(self, op: str, left_type: Any,
-                                  right_type: Any, context: Context) -> None:
+    def unsupported_operand_types(self,
+                                  op: str,
+                                  left_type: Any,
+                                  right_type: Any,
+                                  context: Context,
+                                  *,
+                                  code: ErrorCode = codes.OPERATOR) -> None:
         """Report unsupported operand types for a binary operation.
 
         Types can be Type objects or strings.
@@ -261,7 +340,7 @@ class MessageBuilder:
         else:
             msg = 'Unsupported operand types for {} ({} and {})'.format(
                 op, left_str, right_str)
-        self.fail(msg, context)
+        self.fail(msg, context, code=code)
 
     def unsupported_left_operand(self, op: str, typ: Type,
                                  context: Context) -> None:
@@ -270,7 +349,7 @@ class MessageBuilder:
         else:
             msg = 'Unsupported left operand type for {} ({})'.format(
                 op, format_type(typ))
-        self.fail(msg, context)
+        self.fail(msg, context, code=codes.OPERATOR)
 
     def not_callable(self, typ: Type, context: Context) -> Type:
         self.fail('{} not callable'.format(format_type(typ)), context)
@@ -278,18 +357,30 @@ class MessageBuilder:
 
     def untyped_function_call(self, callee: CallableType, context: Context) -> Type:
         name = callable_name(callee) or '(unknown)'
-        self.fail('Call to untyped function {} in typed context'.format(name), context)
+        self.fail('Call to untyped function {} in typed context'.format(name), context,
+                  code=codes.NO_UNTYPED_CALL)
         return AnyType(TypeOfAny.from_error)
 
-    def incompatible_argument(self, n: int, m: int, callee: CallableType, arg_type: Type,
-                              arg_kind: int, context: Context) -> None:
+    def incompatible_argument(self,
+                              n: int,
+                              m: int,
+                              callee: CallableType,
+                              arg_type: Type,
+                              arg_kind: int,
+                              context: Context,
+                              outer_context: Context) -> Optional[ErrorCode]:
         """Report an error about an incompatible argument type.
 
         The argument type is arg_type, argument number is n and the
         callee type is 'callee'. If the callee represents a method
         that corresponds to an operator, use the corresponding
         operator name in the messages.
+
+        Return the error code that used for the argument (multiple error
+        codes are possible).
         """
+        arg_type = get_proper_type(arg_type)
+
         target = ''
         callee_name = callable_name(callee)
         if callee_name is not None:
@@ -299,38 +390,47 @@ class MessageBuilder:
             else:
                 base = extract_type(name)
 
-            for op, method in op_methods.items():
+            for method, op in op_methods_to_symbols.items():
                 for variant in method, '__r' + method[2:]:
                     # FIX: do not rely on textual formatting
                     if name.startswith('"{}" of'.format(variant)):
                         if op == 'in' or variant != method:
                             # Reversed order of base/argument.
                             self.unsupported_operand_types(op, arg_type, base,
-                                                           context)
+                                                           context, code=codes.OPERATOR)
                         else:
                             self.unsupported_operand_types(op, base, arg_type,
-                                                           context)
-                        return
+                                                           context, code=codes.OPERATOR)
+                        return codes.OPERATOR
+
+            if name.startswith('"__cmp__" of'):
+                self.unsupported_operand_types("comparison", arg_type, base,
+                                               context, code=codes.OPERATOR)
+                return codes.INDEX
 
             if name.startswith('"__getitem__" of'):
-                self.invalid_index_type(arg_type, callee.arg_types[n - 1], base, context)
-                return
+                self.invalid_index_type(arg_type, callee.arg_types[n - 1], base, context,
+                                        code=codes.INDEX)
+                return codes.INDEX
 
             if name.startswith('"__setitem__" of'):
                 if n == 1:
-                    self.invalid_index_type(arg_type, callee.arg_types[n - 1], base, context)
+                    self.invalid_index_type(arg_type, callee.arg_types[n - 1], base, context,
+                                            code=codes.INDEX)
+                    return codes.INDEX
                 else:
                     msg = '{} (expression has type {}, target has type {})'
                     arg_type_str, callee_type_str = format_type_distinctly(arg_type,
                                                                            callee.arg_types[n - 1])
                     self.fail(msg.format(message_registry.INCOMPATIBLE_TYPES_IN_ASSIGNMENT,
                                          arg_type_str, callee_type_str),
-                              context)
-                return
+                              context, code=codes.ASSIGNMENT)
+                    return codes.ASSIGNMENT
 
             target = 'to {} '.format(name)
 
         msg = ''
+        code = codes.MISC
         notes = []  # type: List[str]
         if callee_name == '<list>':
             name = callee_name[1:-1]
@@ -339,6 +439,7 @@ class MessageBuilder:
                                                                         callee.arg_types[0])
             msg = '{} item {} has incompatible type {}; expected {}'.format(
                 name.title(), n, actual_type_str, expected_type_str)
+            code = codes.LIST_ITEM
         elif callee_name == '<dict>':
             name = callee_name[1:-1]
             n -= 1
@@ -346,7 +447,6 @@ class MessageBuilder:
             expected_key_type, expected_value_type = cast(TupleType, callee.arg_types[0]).items
 
             # don't increase verbosity unless there is need to do so
-            from mypy.subtypes import is_subtype
             if is_subtype(key_type, expected_key_type):
                 key_type_str = format_type(key_type)
                 expected_key_type_str = format_type(expected_key_type)
@@ -363,6 +463,7 @@ class MessageBuilder:
             msg = '{} entry {} has incompatible type {}: {}; expected {}: {}'.format(
                 name.title(), n, key_type_str, value_type_str,
                 expected_key_type_str, expected_value_type_str)
+            code = codes.DICT_ITEM
         elif callee_name == '<list-comprehension>':
             actual_type_str, expected_type_str = map(strip_quotes,
                                                      format_type_distinctly(arg_type,
@@ -403,8 +504,8 @@ class MessageBuilder:
             # For function calls with keyword arguments, display the argument name rather than the
             # number.
             arg_label = str(n)
-            if isinstance(context, CallExpr) and len(context.arg_names) >= n:
-                arg_name = context.arg_names[n - 1]
+            if isinstance(outer_context, CallExpr) and len(outer_context.arg_names) >= n:
+                arg_name = outer_context.arg_names[n - 1]
                 if arg_name is not None:
                     arg_label = '"{}"'.format(arg_name)
 
@@ -423,30 +524,48 @@ class MessageBuilder:
             msg = 'Argument {} {}has incompatible type {}; expected {}'.format(
                 arg_label, target, quote_type_string(arg_type_str),
                 quote_type_string(expected_type_str))
+            code = codes.ARG_TYPE
+            expected_type = get_proper_type(expected_type)
             if isinstance(expected_type, UnionType):
-                expected_types = expected_type.items
+                expected_types = list(expected_type.items)
             else:
                 expected_types = [expected_type]
-            for type in expected_types:
+            for type in get_proper_types(expected_types):
                 if isinstance(arg_type, Instance) and isinstance(type, Instance):
                     notes = append_invariance_notes(notes, arg_type, type)
-        self.fail(msg, context)
+        self.fail(msg, context, code=code)
         if notes:
             for note_msg in notes:
-                self.note(note_msg, context)
+                self.note(note_msg, context, code=code)
+        return code
+
+    def incompatible_argument_note(self,
+                                   original_caller_type: ProperType,
+                                   callee_type: ProperType,
+                                   context: Context,
+                                   code: Optional[ErrorCode]) -> None:
+        if (isinstance(original_caller_type, (Instance, TupleType, TypedDictType)) and
+                isinstance(callee_type, Instance) and callee_type.type.is_protocol):
+            self.report_protocol_problems(original_caller_type, callee_type, context, code=code)
+        if (isinstance(callee_type, CallableType) and
+                isinstance(original_caller_type, Instance)):
+            call = find_member('__call__', original_caller_type, original_caller_type,
+                               is_operator=True)
+            if call:
+                self.note_call(original_caller_type, call, context, code=code)
 
     def invalid_index_type(self, index_type: Type, expected_type: Type, base_str: str,
-                           context: Context) -> None:
+                           context: Context, *, code: ErrorCode) -> None:
         index_str, expected_str = format_type_distinctly(index_type, expected_type)
         self.fail('Invalid index type {} for {}; expected type {}'.format(
-            index_str, base_str, expected_str), context)
+            index_str, base_str, expected_str), context, code=code)
 
     def too_few_arguments(self, callee: CallableType, context: Context,
                           argument_names: Optional[Sequence[Optional[str]]]) -> None:
         if (argument_names is not None and not all(k is None for k in argument_names)
                 and len(argument_names) >= 1):
             num_positional_args = sum(k is None for k in argument_names)
-            arguments_left = callee.arg_names[num_positional_args:]
+            arguments_left = callee.arg_names[num_positional_args:callee.min_args]
             diff = [k for k in arguments_left if k not in argument_names]
             if len(diff) == 1:
                 msg = 'Missing positional argument'
@@ -458,15 +577,15 @@ class MessageBuilder:
                 msg += ' "{}" in call to {}'.format(args, callee_name)
         else:
             msg = 'Too few arguments' + for_function(callee)
-        self.fail(msg, context)
+        self.fail(msg, context, code=codes.CALL_ARG)
 
     def missing_named_argument(self, callee: CallableType, context: Context, name: str) -> None:
         msg = 'Missing named argument "{}"'.format(name) + for_function(callee)
-        self.fail(msg, context)
+        self.fail(msg, context, code=codes.CALL_ARG)
 
     def too_many_arguments(self, callee: CallableType, context: Context) -> None:
         msg = 'Too many arguments' + for_function(callee)
-        self.fail(msg, context)
+        self.fail(msg, context, code=codes.CALL_ARG)
 
     def too_many_arguments_from_typed_dict(self,
                                            callee: CallableType,
@@ -487,10 +606,25 @@ class MessageBuilder:
         msg = 'Too many positional arguments' + for_function(callee)
         self.fail(msg, context)
 
-    def unexpected_keyword_argument(self, callee: CallableType, name: str,
+    def unexpected_keyword_argument(self, callee: CallableType, name: str, arg_type: Type,
                                     context: Context) -> None:
         msg = 'Unexpected keyword argument "{}"'.format(name) + for_function(callee)
-        self.fail(msg, context)
+        # Suggest intended keyword, look for type match else fallback on any match.
+        matching_type_args = []
+        not_matching_type_args = []
+        for i, kwarg_type in enumerate(callee.arg_types):
+            callee_arg_name = callee.arg_names[i]
+            if callee_arg_name is not None and callee.arg_kinds[i] != ARG_STAR:
+                if is_subtype(arg_type, kwarg_type):
+                    matching_type_args.append(callee_arg_name)
+                else:
+                    not_matching_type_args.append(callee_arg_name)
+        matches = best_matches(name, matching_type_args)
+        if not matches:
+            matches = best_matches(name, not_matching_type_args)
+        if matches:
+            msg += "; did you mean {}?".format(pretty_or(matches[:3]))
+        self.fail(msg, context, code=codes.CALL_ARG)
         module = find_defining_module(self.modules, callee)
         if module:
             assert callee.definition is not None
@@ -498,7 +632,7 @@ class MessageBuilder:
             if not fname:  # an alias to function with a different name
                 fname = 'Called function'
             self.note('{} defined here'.format(fname), callee.definition,
-                      file=module.path, origin=context)
+                      file=module.path, origin=context, code=codes.CALL_ARG)
 
     def duplicate_argument_value(self, callee: CallableType, index: int,
                                  context: Context) -> None:
@@ -509,12 +643,14 @@ class MessageBuilder:
     def does_not_return_value(self, callee_type: Optional[Type], context: Context) -> None:
         """Report an error about use of an unusable type."""
         name = None  # type: Optional[str]
+        callee_type = get_proper_type(callee_type)
         if isinstance(callee_type, FunctionLike):
             name = callable_name(callee_type)
         if name is not None:
-            self.fail('{} does not return a value'.format(capitalize(name)), context)
+            self.fail('{} does not return a value'.format(capitalize(name)), context,
+                      code=codes.FUNC_RETURNS_VALUE)
         else:
-            self.fail('Function does not return a value', context)
+            self.fail('Function does not return a value', context, code=codes.FUNC_RETURNS_VALUE)
 
     def deleted_as_rvalue(self, typ: DeletedType, context: Context) -> None:
         """Report an error about using an deleted type as an rvalue."""
@@ -540,7 +676,10 @@ class MessageBuilder:
                                      plausible_targets: List[CallableType],
                                      overload: Overloaded,
                                      arg_types: List[Type],
-                                     context: Context) -> None:
+                                     context: Context,
+                                     *,
+                                     code: Optional[ErrorCode] = None) -> None:
+        code = code or codes.CALL_OVERLOAD
         name = callable_name(overload)
         if name:
             name_str = ' of {}'.format(name)
@@ -550,15 +689,16 @@ class MessageBuilder:
         num_args = len(arg_types)
         if num_args == 0:
             self.fail('All overload variants{} require at least one argument'.format(name_str),
-                      context)
+                      context, code=code)
         elif num_args == 1:
             self.fail('No overload variant{} matches argument type {}'
-                      .format(name_str, arg_types_str), context)
+                      .format(name_str, arg_types_str), context, code=code)
         else:
             self.fail('No overload variant{} matches argument types {}'
-                      .format(name_str, arg_types_str), context)
+                      .format(name_str, arg_types_str), context, code=code)
 
-        self.pretty_overload_matches(plausible_targets, overload, context, offset=2, max_items=2)
+        self.pretty_overload_matches(plausible_targets, overload, context, offset=2, max_items=2,
+                                     code=code)
 
     def wrong_number_values_to_unpack(self, provided: int, expected: int,
                                       context: Context) -> None:
@@ -586,17 +726,17 @@ class MessageBuilder:
             overload: Overloaded, context: Context) -> None:
         target = self.override_target(name, name_in_super, supertype)
         self.fail('Signature of "{}" incompatible with {}'.format(
-            name, target), context)
+            name, target), context, code=codes.OVERRIDE)
 
         note_template = 'Overload variants must be defined in the same order as they are in "{}"'
-        self.note(note_template.format(supertype), context)
+        self.note(note_template.format(supertype), context, code=codes.OVERRIDE)
 
     def signature_incompatible_with_supertype(
             self, name: str, name_in_super: str, supertype: str,
             context: Context) -> None:
         target = self.override_target(name, name_in_super, supertype)
         self.fail('Signature of "{}" incompatible with {}'.format(
-            name, target), context)
+            name, target), context, code=codes.OVERRIDE)
 
     def argument_incompatible_with_supertype(
             self, arg_num: int, name: str, type_name: Optional[str],
@@ -606,11 +746,13 @@ class MessageBuilder:
         arg_type_in_supertype_f = format_type_bare(arg_type_in_supertype)
         self.fail('Argument {} of "{}" is incompatible with {}; '
                   'supertype defines the argument type as "{}"'
-                  .format(arg_num, name, target, arg_type_in_supertype_f), context)
+                  .format(arg_num, name, target, arg_type_in_supertype_f),
+                  context,
+                  code=codes.OVERRIDE)
 
         if name == "__eq__" and type_name:
             multiline_msg = self.comparison_method_example_msg(class_name=type_name)
-            self.note_multiline(multiline_msg, context)
+            self.note_multiline(multiline_msg, context, code=codes.OVERRIDE)
 
     def comparison_method_example_msg(self, class_name: str) -> str:
         return dedent('''\
@@ -628,7 +770,9 @@ class MessageBuilder:
         target = self.override_target(name, name_in_supertype, supertype)
         override_str, original_str = format_type_distinctly(override, original)
         self.fail('Return type {} of "{}" incompatible with return type {} in {}'
-                  .format(override_str, name, original_str, target), context)
+                  .format(override_str, name, original_str, target),
+                  context,
+                  code=codes.OVERRIDE)
 
     def override_target(self, name: str, name_in_super: str,
                         supertype: str) -> str:
@@ -650,7 +794,7 @@ class MessageBuilder:
             self.fail('Type application has too few types ({} expected)'
                       .format(expected_arg_count), context)
 
-    def alias_invalid_in_runtime_context(self, item: Type, ctx: Context) -> None:
+    def alias_invalid_in_runtime_context(self, item: ProperType, ctx: Context) -> None:
         kind = (' to Callable' if isinstance(item, CallableType) else
                 ' to Tuple' if isinstance(item, TupleType) else
                 ' to Union' if isinstance(item, UnionType) else
@@ -670,6 +814,7 @@ class MessageBuilder:
         self.fail('List or tuple expected as variable arguments', context)
 
     def invalid_keyword_var_arg(self, typ: Type, is_mapping: bool, context: Context) -> None:
+        typ = get_proper_type(typ)
         if isinstance(typ, Instance) and is_mapping:
             self.fail('Keywords must be strings', context)
         else:
@@ -684,6 +829,7 @@ class MessageBuilder:
         self.fail('"{}" undefined in superclass'.format(member), context)
 
     def first_argument_for_super_must_be_type(self, actual: Type, context: Context) -> None:
+        actual = get_proper_type(actual)
         if isinstance(actual, Instance):
             # Don't include type of instance, because it can look confusingly like a type
             # object.
@@ -693,28 +839,36 @@ class MessageBuilder:
         self.fail('Argument 1 for "super" must be a type object; got {}'.format(type_str), context)
 
     def too_few_string_formatting_arguments(self, context: Context) -> None:
-        self.fail('Not enough arguments for format string', context)
+        self.fail('Not enough arguments for format string', context,
+                  code=codes.STRING_FORMATTING)
 
     def too_many_string_formatting_arguments(self, context: Context) -> None:
-        self.fail('Not all arguments converted during string formatting', context)
+        self.fail('Not all arguments converted during string formatting', context,
+                  code=codes.STRING_FORMATTING)
 
     def unsupported_placeholder(self, placeholder: str, context: Context) -> None:
-        self.fail('Unsupported format character \'%s\'' % placeholder, context)
+        self.fail('Unsupported format character \'%s\'' % placeholder, context,
+                  code=codes.STRING_FORMATTING)
 
     def string_interpolation_with_star_and_key(self, context: Context) -> None:
-        self.fail('String interpolation contains both stars and mapping keys', context)
+        self.fail('String interpolation contains both stars and mapping keys', context,
+                  code=codes.STRING_FORMATTING)
 
-    def requires_int_or_char(self, context: Context) -> None:
-        self.fail('%c requires int or char', context)
+    def requires_int_or_char(self, context: Context,
+                             format_call: bool = False) -> None:
+        self.fail('"{}c" requires int or char'.format(':' if format_call else '%'),
+                  context, code=codes.STRING_FORMATTING)
 
     def key_not_in_mapping(self, key: str, context: Context) -> None:
-        self.fail('Key \'%s\' not found in mapping' % key, context)
+        self.fail('Key \'%s\' not found in mapping' % key, context,
+                  code=codes.STRING_FORMATTING)
 
     def string_interpolation_mixing_key_and_non_keys(self, context: Context) -> None:
-        self.fail('String interpolation mixes specifier with and without mapping keys', context)
+        self.fail('String interpolation mixes specifier with and without mapping keys', context,
+                  code=codes.STRING_FORMATTING)
 
     def cannot_determine_type(self, name: str, context: Context) -> None:
-        self.fail("Cannot determine type of '%s'" % name, context)
+        self.fail("Cannot determine type of '%s'" % name, context, code=codes.HAS_TYPE)
 
     def cannot_determine_type_in_base(self, name: str, base: str, context: Context) -> None:
         self.fail("Cannot determine type of '%s' in base class '%s'" % (name, base), context)
@@ -740,17 +894,18 @@ class MessageBuilder:
         self.fail("Cannot instantiate abstract class '%s' with abstract "
                   "attribute%s %s" % (class_name, plural_s(abstract_attributes),
                                    attrs),
-                  context)
+                  context, code=codes.ABSTRACT)
 
     def base_class_definitions_incompatible(self, name: str, base1: TypeInfo,
                                             base2: TypeInfo,
                                             context: Context) -> None:
         self.fail('Definition of "{}" in base class "{}" is incompatible '
                   'with definition in base class "{}"'.format(
-                      name, base1.name(), base2.name()), context)
+                      name, base1.name, base2.name), context)
 
     def cant_assign_to_method(self, context: Context) -> None:
-        self.fail(message_registry.CANNOT_ASSIGN_TO_METHOD, context)
+        self.fail(message_registry.CANNOT_ASSIGN_TO_METHOD, context,
+                  code=codes.ASSIGNMENT)
 
     def cant_assign_to_classvar(self, name: str, context: Context) -> None:
         self.fail('Cannot assign to class variable "%s" via instance' % name, context)
@@ -779,7 +934,7 @@ class MessageBuilder:
     def read_only_property(self, name: str, type: TypeInfo,
                            context: Context) -> None:
         self.fail('Property "{}" defined in "{}" is read-only'.format(
-            name, type.name()), context)
+            name, type.name), context)
 
     def incompatible_typevar_value(self,
                                    callee: CallableType,
@@ -788,14 +943,16 @@ class MessageBuilder:
                                    context: Context) -> None:
         self.fail(message_registry.INCOMPATIBLE_TYPEVAR_VALUE
                   .format(typevar_name, callable_name(callee) or 'function', format_type(typ)),
-                  context)
+                  context,
+                  code=codes.TYPE_VAR)
 
     def dangerous_comparison(self, left: Type, right: Type, kind: str, ctx: Context) -> None:
         left_str = 'element' if kind == 'container' else 'left operand'
         right_str = 'container item' if kind == 'container' else 'right operand'
         message = 'Non-overlapping {} check ({} type: {}, {} type: {})'
         left_typ, right_typ = format_type_distinctly(left, right)
-        self.fail(message.format(kind, left_str, left_typ, right_str, right_typ), ctx)
+        self.fail(message.format(kind, left_str, left_typ, right_str, right_typ), ctx,
+                  code=codes.COMPARISON_OVERLAP)
 
     def overload_inconsistently_applies_decorator(self, decorator: str, context: Context) -> None:
         self.fail(
@@ -829,17 +986,18 @@ class MessageBuilder:
                   'of signature {}'.format(index), context)
 
     def warn_both_operands_are_from_unions(self, context: Context) -> None:
-        self.note('Both left and right operands are unions', context)
+        self.note('Both left and right operands are unions', context, code=codes.OPERATOR)
 
     def warn_operand_was_from_union(self, side: str, original: Type, context: Context) -> None:
-        self.note('{} operand is of type {}'.format(side, format_type(original)), context)
+        self.note('{} operand is of type {}'.format(side, format_type(original)), context,
+                  code=codes.OPERATOR)
 
     def operator_method_signatures_overlap(
             self, reverse_class: TypeInfo, reverse_method: str, forward_class: Type,
             forward_method: str, context: Context) -> None:
         self.fail('Signatures of "{}" of "{}" and "{}" of {} '
                   'are unsafely overlapping'.format(
-                      reverse_method, reverse_class.name(),
+                      reverse_method, reverse_class.name,
                       forward_method, format_type(forward_class)),
                   context)
 
@@ -880,11 +1038,12 @@ class MessageBuilder:
         self.fail('Unsupported type Type[{}]'.format(format_type(item)), context)
 
     def redundant_cast(self, typ: Type, context: Context) -> None:
-        self.fail('Redundant cast to {}'.format(format_type(typ)), context)
+        self.fail('Redundant cast to {}'.format(format_type(typ)), context,
+                  code=codes.REDUNDANT_CAST)
 
     def unimported_type_becomes_any(self, prefix: str, typ: Type, ctx: Context) -> None:
         self.fail("{} becomes {} due to an unfollowed import".format(prefix, format_type(typ)),
-                  ctx)
+                  ctx, code=codes.NO_ANY_UNIMPORTED)
 
     def need_annotation_for_var(self, node: SymbolNode, context: Context,
                                 python_version: Optional[Tuple[int, int]] = None) -> None:
@@ -892,23 +1051,24 @@ class MessageBuilder:
         has_variable_annotations = not python_version or python_version >= (3, 6)
         # Only gives hint if it's a variable declaration and the partial type is a builtin type
         if (python_version and isinstance(node, Var) and isinstance(node.type, PartialType) and
-                node.type.type and node.type.type.fullname() in reverse_builtin_aliases):
-            alias = reverse_builtin_aliases[node.type.type.fullname()]
+                node.type.type and node.type.type.fullname in reverse_builtin_aliases):
+            alias = reverse_builtin_aliases[node.type.type.fullname]
             alias = alias.split('.')[-1]
             type_dec = '<type>'
             if alias == 'Dict':
                 type_dec = '{}, {}'.format(type_dec, type_dec)
             if has_variable_annotations:
-                hint = ' (hint: "{}: {}[{}] = ...")'.format(node.name(), alias, type_dec)
+                hint = ' (hint: "{}: {}[{}] = ...")'.format(node.name, alias, type_dec)
             else:
-                hint = ' (hint: "{} = ...  # type: {}[{}]")'.format(node.name(), alias, type_dec)
+                hint = ' (hint: "{} = ...  # type: {}[{}]")'.format(node.name, alias, type_dec)
 
         if has_variable_annotations:
             needed = 'annotation'
         else:
             needed = 'comment'
 
-        self.fail("Need type {} for '{}'{}".format(needed, unmangle(node.name()), hint), context)
+        self.fail("Need type {} for '{}'{}".format(needed, unmangle(node.name), hint), context,
+                  code=codes.VAR_ANNOTATED)
 
     def explicit_any(self, ctx: Context) -> None:
         self.fail('Explicit "Any" is not allowed', ctx)
@@ -928,7 +1088,7 @@ class MessageBuilder:
                 missing = [key for key in expected_keys if key not in actual_set]
                 self.fail('{} missing for TypedDict {}'.format(
                     format_key_list(missing, short=True).capitalize(), format_type(typ)),
-                    context)
+                    context, code=codes.TYPEDDICT_ITEM)
                 return
             else:
                 extra = [key for key in actual_keys if key not in expected_set]
@@ -937,7 +1097,7 @@ class MessageBuilder:
                     # simplicity.
                     self.fail('Extra {} for TypedDict {}'.format(
                         format_key_list(extra, short=True), format_type(typ)),
-                        context)
+                        context, code=codes.TYPEDDICT_ITEM)
                     return
         found = format_key_list(actual_keys, short=True)
         if not expected_keys:
@@ -946,7 +1106,8 @@ class MessageBuilder:
         expected = format_key_list(expected_keys)
         if actual_keys and actual_set < expected_set:
             found = 'only {}'.format(found)
-        self.fail('Expected {} but found {}'.format(expected, found), context)
+        self.fail('Expected {} but found {}'.format(expected, found), context,
+                  code=codes.TYPEDDICT_ITEM)
 
     def typeddict_key_must_be_string_literal(
             self,
@@ -991,6 +1152,7 @@ class MessageBuilder:
         self.fail('Parameterized generics cannot be used with class or instance checks', context)
 
     def disallowed_any_type(self, typ: Type, context: Context) -> None:
+        typ = get_proper_type(typ)
         if isinstance(typ, AnyType):
             message = 'Expression has type "Any"'
         else:
@@ -1000,9 +1162,22 @@ class MessageBuilder:
     def incorrectly_returning_any(self, typ: Type, context: Context) -> None:
         message = 'Returning Any from function declared to return {}'.format(
             format_type(typ))
-        self.fail(message, context)
+        self.fail(message, context, code=codes.NO_ANY_RETURN)
+
+    def incorrect__exit__return(self, context: Context) -> None:
+        self.fail(
+            '"bool" is invalid as return type for "__exit__" that always returns False', context,
+            code=codes.EXIT_RETURN)
+        self.note(
+            'Use "typing_extensions.Literal[False]" as the return type or change it to "None"',
+            context, code=codes.EXIT_RETURN)
+        self.note(
+            'If return type of "__exit__" implies that it may return True, '
+            'the context manager may swallow exceptions',
+            context, code=codes.EXIT_RETURN)
 
     def untyped_decorated_function(self, typ: Type, context: Context) -> None:
+        typ = get_proper_type(typ)
         if isinstance(typ, AnyType):
             self.fail("Function is untyped after decorator transformation", context)
         else:
@@ -1030,7 +1205,7 @@ class MessageBuilder:
 
     def cannot_use_function_with_type(
             self, method_name: str, type_name: str, context: Context) -> None:
-        self.fail("Cannot use {}() with a {} type".format(method_name, type_name), context)
+        self.fail("Cannot use {}() with {} type".format(method_name, type_name), context)
 
     def report_non_method_protocol(self, tp: TypeInfo, members: List[str],
                                    context: Context) -> None:
@@ -1039,11 +1214,17 @@ class MessageBuilder:
         if len(members) < 3:
             attrs = ', '.join(members)
             self.note('Protocol "{}" has non-method member(s): {}'
-                      .format(tp.name(), attrs), context)
+                      .format(tp.name, attrs), context)
 
-    def note_call(self, subtype: Type, call: Type, context: Context) -> None:
+    def note_call(self,
+                  subtype: Type,
+                  call: Type,
+                  context: Context,
+                  *,
+                  code: Optional[ErrorCode]) -> None:
         self.note('"{}.__call__" has type {}'.format(format_type_bare(subtype),
-                                                     format_type(call, verbosity=1)), context)
+                                                     format_type(call, verbosity=1)),
+                  context, code=code)
 
     def unreachable_statement(self, context: Context) -> None:
         self.fail("Statement is unreachable", context)
@@ -1074,15 +1255,18 @@ class MessageBuilder:
     def redundant_expr(self, description: str, truthiness: bool, context: Context) -> None:
         self.fail("{} is always {}".format(description, str(truthiness).lower()), context)
 
-    def report_protocol_problems(self, subtype: Union[Instance, TupleType, TypedDictType],
-                                 supertype: Instance, context: Context) -> None:
+    def report_protocol_problems(self,
+                                 subtype: Union[Instance, TupleType, TypedDictType],
+                                 supertype: Instance,
+                                 context: Context,
+                                 *,
+                                 code: Optional[ErrorCode]) -> None:
         """Report possible protocol conflicts between 'subtype' and 'supertype'.
 
         This includes missing members, incompatible types, and incompatible
         attribute flags, such as settable vs read-only or class variable vs
         instance variable.
         """
-        from mypy.subtypes import is_subtype, IS_SETTABLE, IS_CLASSVAR, IS_CLASS_OR_STATIC
         OFFSET = 4  # Four spaces, so that notes will look like this:
         # note: 'Cls' is missing following 'Proto' members:
         # note:     method, attr
@@ -1091,9 +1275,9 @@ class MessageBuilder:
         exclusions = {TypedDictType: ['typing.Mapping'],
                       TupleType: ['typing.Iterable', 'typing.Sequence'],
                       Instance: []}  # type: Dict[type, List[str]]
-        if supertype.type.fullname() in exclusions[type(subtype)]:
+        if supertype.type.fullname in exclusions[type(subtype)]:
             return
-        if any(isinstance(tp, UninhabitedType) for tp in supertype.args):
+        if any(isinstance(tp, UninhabitedType) for tp in get_proper_types(supertype.args)):
             # We don't want to add notes for failed inference (e.g. Iterable[<nothing>]).
             # This will be only confusing a user even more.
             return
@@ -1112,9 +1296,10 @@ class MessageBuilder:
         if (missing and len(missing) < len(supertype.type.protocol_members) and
                 len(missing) <= MAX_ITEMS):
             self.note("'{}' is missing following '{}' protocol member{}:"
-                      .format(subtype.type.name(), supertype.type.name(), plural_s(missing)),
-                      context)
-            self.note(', '.join(missing), context, offset=OFFSET)
+                      .format(subtype.type.name, supertype.type.name, plural_s(missing)),
+                      context,
+                      code=code)
+            self.note(', '.join(missing), context, offset=OFFSET, code=code)
         elif len(missing) > MAX_ITEMS or len(missing) == len(supertype.type.protocol_members):
             # This is an obviously wrong type: too many missing members
             return
@@ -1125,61 +1310,81 @@ class MessageBuilder:
                                not subtype.type.defn.type_vars or
                                not supertype.type.defn.type_vars):
             self.note('Following member(s) of {} have '
-                      'conflicts:'.format(format_type(subtype)), context)
+                      'conflicts:'.format(format_type(subtype)),
+                      context,
+                      code=code)
             for name, got, exp in conflict_types[:MAX_ITEMS]:
+                exp = get_proper_type(exp)
+                got = get_proper_type(got)
                 if (not isinstance(exp, (CallableType, Overloaded)) or
                         not isinstance(got, (CallableType, Overloaded))):
                     self.note('{}: expected {}, got {}'.format(name,
                                                                *format_type_distinctly(exp, got)),
-                              context, offset=OFFSET)
+                              context,
+                              offset=OFFSET,
+                              code=code)
                 else:
-                    self.note('Expected:', context, offset=OFFSET)
+                    self.note('Expected:', context, offset=OFFSET, code=code)
                     if isinstance(exp, CallableType):
-                        self.note(pretty_callable(exp), context, offset=2 * OFFSET)
+                        self.note(pretty_callable(exp), context, offset=2 * OFFSET, code=code)
                     else:
                         assert isinstance(exp, Overloaded)
-                        self.pretty_overload(exp, context, OFFSET, MAX_ITEMS)
-                    self.note('Got:', context, offset=OFFSET)
+                        self.pretty_overload(exp, context, OFFSET, MAX_ITEMS, code=code)
+                    self.note('Got:', context, offset=OFFSET, code=code)
                     if isinstance(got, CallableType):
-                        self.note(pretty_callable(got), context, offset=2 * OFFSET)
+                        self.note(pretty_callable(got), context, offset=2 * OFFSET, code=code)
                     else:
                         assert isinstance(got, Overloaded)
-                        self.pretty_overload(got, context, OFFSET, MAX_ITEMS)
-            self.print_more(conflict_types, context, OFFSET, MAX_ITEMS)
+                        self.pretty_overload(got, context, OFFSET, MAX_ITEMS, code=code)
+            self.print_more(conflict_types, context, OFFSET, MAX_ITEMS, code=code)
 
         # Report flag conflicts (i.e. settable vs read-only etc.)
         conflict_flags = get_bad_protocol_flags(subtype, supertype)
         for name, subflags, superflags in conflict_flags[:MAX_ITEMS]:
             if IS_CLASSVAR in subflags and IS_CLASSVAR not in superflags:
                 self.note('Protocol member {}.{} expected instance variable,'
-                          ' got class variable'.format(supertype.type.name(), name), context)
+                          ' got class variable'.format(supertype.type.name, name),
+                          context,
+                          code=code)
             if IS_CLASSVAR in superflags and IS_CLASSVAR not in subflags:
                 self.note('Protocol member {}.{} expected class variable,'
-                          ' got instance variable'.format(supertype.type.name(), name), context)
+                          ' got instance variable'.format(supertype.type.name, name),
+                          context,
+                          code=code)
             if IS_SETTABLE in superflags and IS_SETTABLE not in subflags:
                 self.note('Protocol member {}.{} expected settable variable,'
-                          ' got read-only attribute'.format(supertype.type.name(), name), context)
+                          ' got read-only attribute'.format(supertype.type.name, name),
+                          context,
+                          code=code)
             if IS_CLASS_OR_STATIC in superflags and IS_CLASS_OR_STATIC not in subflags:
                 self.note('Protocol member {}.{} expected class or static method'
-                          .format(supertype.type.name(), name), context)
-        self.print_more(conflict_flags, context, OFFSET, MAX_ITEMS)
+                          .format(supertype.type.name, name),
+                          context,
+                          code=code)
+        self.print_more(conflict_flags, context, OFFSET, MAX_ITEMS, code=code)
 
-    def pretty_overload(self, tp: Overloaded, context: Context,
-                        offset: int, max_items: int) -> None:
+    def pretty_overload(self,
+                        tp: Overloaded,
+                        context: Context,
+                        offset: int,
+                        max_items: int,
+                        *,
+                        code: Optional[ErrorCode] = None) -> None:
         for item in tp.items()[:max_items]:
-            self.note('@overload', context, offset=2 * offset)
-            self.note(pretty_callable(item), context, offset=2 * offset)
+            self.note('@overload', context, offset=2 * offset, code=code)
+            self.note(pretty_callable(item), context, offset=2 * offset, code=code)
         left = len(tp.items()) - max_items
         if left > 0:
             msg = '<{} more overload{} not shown>'.format(left, plural_s(left))
-            self.note(msg, context, offset=2 * offset)
+            self.note(msg, context, offset=2 * offset, code=code)
 
     def pretty_overload_matches(self,
                                 targets: List[CallableType],
                                 func: Overloaded,
                                 context: Context,
                                 offset: int,
-                                max_items: int) -> None:
+                                max_items: int,
+                                code: ErrorCode) -> None:
         if not targets:
             targets = func.items()
 
@@ -1192,29 +1397,112 @@ class MessageBuilder:
         if shown + 1 == max_matching:
             shown = max_matching
 
-        self.note('Possible overload variant{}:'.format(plural_s(shown)), context)
+        self.note('Possible overload variant{}:'.format(plural_s(shown)), context, code=code)
         for item in targets[:shown]:
-            self.note(pretty_callable(item), context, offset=2 * offset)
+            self.note(pretty_callable(item), context, offset=2 * offset, code=code)
 
         assert shown <= max_matching <= max_available
         if shown < max_matching <= max_available:
             left = max_matching - shown
             msg = '<{} more similar overload{} not shown, out of {} total overloads>'.format(
                 left, plural_s(left), max_available)
-            self.note(msg, context, offset=2 * offset)
+            self.note(msg, context, offset=2 * offset, code=code)
         elif shown == max_matching < max_available:
             left = max_available - shown
             msg = '<{} more non-matching overload{} not shown>'.format(left, plural_s(left))
-            self.note(msg, context, offset=2 * offset)
+            self.note(msg, context, offset=2 * offset, code=code)
         else:
             assert shown == max_matching == max_available
 
-    def print_more(self, conflicts: Sequence[Any], context: Context,
-                   offset: int, max_items: int) -> None:
+    def print_more(self,
+                   conflicts: Sequence[Any],
+                   context: Context,
+                   offset: int,
+                   max_items: int,
+                   *,
+                   code: Optional[ErrorCode] = None) -> None:
         if len(conflicts) > max_items:
             self.note('<{} more conflict(s) not shown>'
                       .format(len(conflicts) - max_items),
-                      context, offset=offset)
+                      context, offset=offset, code=code)
+
+    def try_report_long_tuple_assignment_error(self,
+                                               subtype: ProperType,
+                                               supertype: ProperType,
+                                               context: Context,
+                                               msg: str = message_registry.INCOMPATIBLE_TYPES,
+                                               subtype_label: Optional[str] = None,
+                                               supertype_label: Optional[str] = None,
+                                               code: Optional[ErrorCode] = None) -> bool:
+        """Try to generate meaningful error message for very long tuple assignment
+
+        Returns a bool: True when generating long tuple assignment error,
+        False when no such error reported
+        """
+        if isinstance(subtype, TupleType):
+            if (len(subtype.items) > 10 and
+                isinstance(supertype, Instance) and
+                    supertype.type.fullname == 'builtins.tuple'):
+                lhs_type = supertype.args[0]
+                lhs_types = [lhs_type] * len(subtype.items)
+                self.generate_incompatible_tuple_error(lhs_types,
+                                    subtype.items, context, msg, code)
+                return True
+            elif (isinstance(supertype, TupleType) and
+                    (len(subtype.items) > 10 or len(supertype.items) > 10)):
+                if len(subtype.items) != len(supertype.items):
+                    if supertype_label is not None and subtype_label is not None:
+                        error_msg = "{} ({} {}, {} {})".format(msg, subtype_label,
+                                        self.format_long_tuple_type(subtype), supertype_label,
+                                        self.format_long_tuple_type(supertype))
+                        self.fail(error_msg, context, code=code)
+                        return True
+                self.generate_incompatible_tuple_error(supertype.items,
+                                    subtype.items, context, msg, code)
+                return True
+        return False
+
+    def format_long_tuple_type(self, typ: TupleType) -> str:
+        """Format very long tuple type using an ellipsis notation"""
+        item_cnt = len(typ.items)
+        if item_cnt > 10:
+            return 'Tuple[{}, {}, ... <{} more items>]'\
+                    .format(format_type_bare(typ.items[0]),
+                        format_type_bare(typ.items[1]), str(item_cnt - 2))
+        else:
+            return format_type_bare(typ)
+
+    def generate_incompatible_tuple_error(self,
+                                          lhs_types: List[Type],
+                                          rhs_types: List[Type],
+                                          context: Context,
+                                          msg: str = message_registry.INCOMPATIBLE_TYPES,
+                                          code: Optional[ErrorCode] = None) -> None:
+        """Generate error message for individual incompatible tuple pairs"""
+        error_cnt = 0
+        notes = []  # List[str]
+        for i, (lhs_t, rhs_t) in enumerate(zip(lhs_types, rhs_types)):
+            if not is_subtype(lhs_t, rhs_t):
+                if error_cnt < 3:
+                    notes.append('Expression tuple item {} has type "{}"; "{}" expected; '
+                        .format(str(i), format_type_bare(rhs_t), format_type_bare(lhs_t)))
+                error_cnt += 1
+
+        error_msg = msg + ' ({} tuple items are incompatible'.format(str(error_cnt))
+        if error_cnt - 3 > 0:
+            error_msg += '; {} items are omitted)'.format(str(error_cnt - 3))
+        else:
+            error_msg += ')'
+        self.fail(error_msg, context, code=code)
+        for note in notes:
+            self.note(note, context, code=code)
+
+    def add_fixture_note(self, fullname: str, ctx: Context) -> None:
+        self.note('Maybe your test fixture does not define "{}"?'.format(fullname), ctx)
+        if fullname in SUGGESTED_TEST_FIXTURES:
+            self.note(
+                'Consider adding [builtins fixtures/{}] to your test description'.format(
+                    SUGGESTED_TEST_FIXTURES[fullname]), ctx)
 
 
 def quote_type_string(type_string: str) -> str:
@@ -1241,45 +1529,43 @@ def format_type_inner(typ: Type,
     def format(typ: Type) -> str:
         return format_type_inner(typ, verbosity, fullnames)
 
+    # TODO: show type alias names in errors.
+    typ = get_proper_type(typ)
+
     if isinstance(typ, Instance):
         itype = typ
         # Get the short name of the type.
-        if itype.type.fullname() in ('types.ModuleType',
-                                     '_importlib_modulespec.ModuleType'):
+        if itype.type.fullname in ('types.ModuleType', '_importlib_modulespec.ModuleType'):
             # Make some common error messages simpler and tidier.
             return 'Module'
-        if verbosity >= 2 or (fullnames and itype.type.fullname() in fullnames):
-            base_str = itype.type.fullname()
+        if verbosity >= 2 or (fullnames and itype.type.fullname in fullnames):
+            base_str = itype.type.fullname
         else:
-            base_str = itype.type.name()
+            base_str = itype.type.name
         if itype.args == []:
             # No type arguments, just return the type name
             return base_str
-        elif itype.type.fullname() == 'builtins.tuple':
+        elif itype.type.fullname == 'builtins.tuple':
             item_type_str = format(itype.args[0])
             return 'Tuple[{}, ...]'.format(item_type_str)
-        elif itype.type.fullname() in reverse_builtin_aliases:
-            alias = reverse_builtin_aliases[itype.type.fullname()]
+        elif itype.type.fullname in reverse_builtin_aliases:
+            alias = reverse_builtin_aliases[itype.type.fullname]
             alias = alias.split('.')[-1]
             items = [format(arg) for arg in itype.args]
             return '{}[{}]'.format(alias, ', '.join(items))
         else:
             # There are type arguments. Convert the arguments to strings.
-            # If the result is too long, replace arguments with [...].
             a = []  # type: List[str]
             for arg in itype.args:
                 a.append(format(arg))
             s = ', '.join(a)
-            if len((base_str + s)) < 150:
-                return '{}[{}]'.format(base_str, s)
-            else:
-                return '{}[...]'.format(base_str)
+            return '{}[{}]'.format(base_str, s)
     elif isinstance(typ, TypeVarType):
         # This is similar to non-generic instance types.
         return typ.name
     elif isinstance(typ, TupleType):
         # Prefer the name of the fallback class (if not tuple), as it's more informative.
-        if typ.partial_fallback.type.fullname() != 'builtins.tuple':
+        if typ.partial_fallback.type.fullname != 'builtins.tuple':
             return format(typ.partial_fallback)
         items = []
         for t in typ.items:
@@ -1310,9 +1596,10 @@ def format_type_inner(typ: Type,
     elif isinstance(typ, UnionType):
         # Only print Unions as Optionals if the Optional wouldn't have to contain another Union
         print_as_optional = (len(typ.items) -
-                             sum(isinstance(t, NoneType) for t in typ.items) == 1)
+                             sum(isinstance(get_proper_type(t), NoneType)
+                                 for t in typ.items) == 1)
         if print_as_optional:
-            rest = [t for t in typ.items if not isinstance(t, NoneType)]
+            rest = [t for t in typ.items if not isinstance(get_proper_type(t), NoneType)]
             return 'Optional[{}]'.format(format(rest[0]))
         else:
             items = []
@@ -1336,11 +1623,6 @@ def format_type_inner(typ: Type,
             return '<nothing>'
     elif isinstance(typ, TypeType):
         return 'Type[{}]'.format(format(typ.item))
-    elif isinstance(typ, ForwardRef):  # may appear in semanal.py
-        if typ.resolved:
-            return format(typ.resolved)
-        else:
-            return format(typ.unbound)
     elif isinstance(typ, FunctionLike):
         func = typ
         if func.is_type_obj():
@@ -1414,7 +1696,7 @@ def find_type_overlaps(*types: Type) -> Set[str]:
     d = {}  # type: Dict[str, Set[str]]
     for type in types:
         for inst in collect_all_instances(type):
-            d.setdefault(inst.type.name(), set()).add(inst.type.fullname())
+            d.setdefault(inst.type.name, set()).add(inst.type.fullname)
 
     overlaps = set()  # type: Set[str]
     for fullnames in d.values():
@@ -1454,8 +1736,8 @@ def format_type_bare(typ: Type,
     return format_type_inner(typ, verbosity, find_type_overlaps(typ))
 
 
-def format_type_distinctly(type1: Type, type2: Type, bare: bool = False) -> Tuple[str, str]:
-    """Jointly format a pair of types to distinct strings.
+def format_type_distinctly(*types: Type, bare: bool = False) -> Tuple[str, ...]:
+    """Jointly format types to distinct strings.
 
     Increase the verbosity of the type strings until they become distinct
     while also requiring that distinct types with the same short name are
@@ -1466,16 +1748,18 @@ def format_type_distinctly(type1: Type, type2: Type, bare: bool = False) -> Tupl
     be quoted; callers who need to do post-processing of the strings before
     quoting them (such as prepending * or **) should use this.
     """
-    overlapping = find_type_overlaps(type1, type2)
+    overlapping = find_type_overlaps(*types)
     for verbosity in range(2):
-        str1 = format_type_inner(type1, verbosity=verbosity, fullnames=overlapping)
-        str2 = format_type_inner(type2, verbosity=verbosity, fullnames=overlapping)
-        if str1 != str2:
+        strs = [
+            format_type_inner(type, verbosity=verbosity, fullnames=overlapping)
+            for type in types
+        ]
+        if len(set(strs)) == len(strs):
             break
     if bare:
-        return (str1, str2)
+        return tuple(strs)
     else:
-        return (quote_type_string(str1), quote_type_string(str2))
+        return tuple(quote_type_string(s) for s in strs)
 
 
 def pretty_callable(tp: CallableType) -> str:
@@ -1504,14 +1788,14 @@ def pretty_callable(tp: CallableType) -> str:
             s += ' = ...'
 
     # If we got a "special arg" (i.e: self, cls, etc...), prepend it to the arg list
-    if tp.definition is not None and tp.definition.name() is not None:
-        definition_args = tp.definition.arg_names  # type: ignore
+    if isinstance(tp.definition, FuncDef) and tp.definition.name is not None:
+        definition_args = tp.definition.arg_names
         if definition_args and tp.arg_names != definition_args \
                 and len(definition_args) > 0:
             if s:
                 s = ', ' + s
             s = definition_args[0] + s
-        s = '{}({})'.format(tp.definition.name(), s)
+        s = '{}({})'.format(tp.definition.name, s)
     elif tp.name:
         first_arg = tp.def_extras.get('first_arg')
         if first_arg:
@@ -1526,10 +1810,10 @@ def pretty_callable(tp: CallableType) -> str:
     if tp.variables:
         tvars = []
         for tvar in tp.variables:
-            if (tvar.upper_bound and isinstance(tvar.upper_bound, Instance) and
-                    tvar.upper_bound.type.fullname() != 'builtins.object'):
-                tvars.append('{} <: {}'.format(tvar.name,
-                                               format_type_bare(tvar.upper_bound)))
+            upper_bound = get_proper_type(tvar.upper_bound)
+            if (isinstance(upper_bound, Instance) and
+                    upper_bound.type.fullname != 'builtins.object'):
+                tvars.append('{} <: {}'.format(tvar.name, format_type_bare(upper_bound)))
             elif tvar.values:
                 tvars.append('{} in ({})'
                              .format(tvar.name, ', '.join([format_type_bare(tp)
@@ -1553,7 +1837,6 @@ def get_missing_protocol_members(left: Instance, right: Instance) -> List[str]:
     """Find all protocol members of 'right' that are not implemented
     (i.e. completely missing) in 'left'.
     """
-    from mypy.subtypes import find_member
     assert right.type.is_protocol
     missing = []  # type: List[str]
     for member in right.type.protocol_members:
@@ -1566,7 +1849,6 @@ def get_conflict_protocol_types(left: Instance, right: Instance) -> List[Tuple[s
     """Find members that are defined in 'left' but have incompatible types.
     Return them as a list of ('member', 'got', 'expected').
     """
-    from mypy.subtypes import find_member, is_subtype, get_member_flags, IS_SETTABLE
     assert right.type.is_protocol
     conflicts = []  # type: List[Tuple[str, Type, Type]]
     for member in right.type.protocol_members:
@@ -1590,8 +1872,6 @@ def get_bad_protocol_flags(left: Instance, right: Instance
     """Return all incompatible attribute flags for members that are present in both
     'left' and 'right'.
     """
-    from mypy.subtypes import (find_member, get_member_flags,
-                               IS_SETTABLE, IS_CLASSVAR, IS_CLASS_OR_STATIC)
     assert right.type.is_protocol
     all_flags = []  # type: List[Tuple[str, Set[int], Set[int]]]
     for member in right.type.protocol_members:
@@ -1678,7 +1958,7 @@ def for_function(callee: CallableType) -> str:
 def find_defining_module(modules: Dict[str, MypyFile], typ: CallableType) -> Optional[MypyFile]:
     if not typ.definition:
         return None
-    fullname = typ.definition.fullname()
+    fullname = typ.definition.fullname
     if fullname is not None and '.' in fullname:
         for i in range(fullname.count('.')):
             module_name = fullname.rsplit('.', i + 1)[0]
@@ -1719,17 +1999,15 @@ def pretty_or(args: List[str]) -> str:
 def append_invariance_notes(notes: List[str], arg_type: Instance,
                             expected_type: Instance) -> List[str]:
     """Explain that the type is invariant and give notes for how to solve the issue."""
-    from mypy.subtypes import is_subtype
-    from mypy.sametypes import is_same_type
     invariant_type = ''
     covariant_suggestion = ''
-    if (arg_type.type.fullname() == 'builtins.list' and
-            expected_type.type.fullname() == 'builtins.list' and
+    if (arg_type.type.fullname == 'builtins.list' and
+            expected_type.type.fullname == 'builtins.list' and
             is_subtype(arg_type.args[0], expected_type.args[0])):
         invariant_type = 'List'
         covariant_suggestion = 'Consider using "Sequence" instead, which is covariant'
-    elif (arg_type.type.fullname() == 'builtins.dict' and
-          expected_type.type.fullname() == 'builtins.dict' and
+    elif (arg_type.type.fullname == 'builtins.dict' and
+          expected_type.type.fullname == 'builtins.dict' and
           is_same_type(arg_type.args[0], expected_type.args[0]) and
           is_subtype(arg_type.args[1], expected_type.args[1])):
         invariant_type = 'Dict'
@@ -1743,8 +2021,10 @@ def append_invariance_notes(notes: List[str], arg_type: Instance,
     return notes
 
 
-def make_inferred_type_note(context: Context, subtype: Type,
-                            supertype: Type, supertype_str: str) -> str:
+def make_inferred_type_note(context: Context,
+                            subtype: Type,
+                            supertype: Type,
+                            supertype_str: str) -> str:
     """Explain that the user may have forgotten to type a variable.
 
     The user does not expect an error if the inferred container type is the same as the return
@@ -1752,10 +2032,11 @@ def make_inferred_type_note(context: Context, subtype: Type,
     return type. This note suggests that they add a type annotation with the return type instead
     of relying on the inferred type.
     """
-    from mypy.subtypes import is_subtype
+    subtype = get_proper_type(subtype)
+    supertype = get_proper_type(supertype)
     if (isinstance(subtype, Instance) and
             isinstance(supertype, Instance) and
-            subtype.type.fullname() == supertype.type.fullname() and
+            subtype.type.fullname == supertype.type.fullname and
             subtype.args and
             supertype.args and
             isinstance(context, ReturnStmt) and
