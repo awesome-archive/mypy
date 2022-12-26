@@ -38,9 +38,9 @@ import typing
 'foo'
 [builtins fixtures/primitives.pyi]
 [out]
-IntExpr(2) : builtins.int
+IntExpr(2) : Literal[5]?
 FloatExpr(3) : builtins.float
-StrExpr(4) : builtins.str
+StrExpr(4) : Literal['foo']?
 
 [case testNameExpression]
 
@@ -100,6 +100,25 @@ CastExpr(8) : A
 NameExpr(8) : B
 CastExpr(9) : B
 NameExpr(9) : B
+
+[case testAssertTypeExpr]
+## AssertTypeExpr|[a-z]
+from typing import Any, assert_type
+d = None # type: Any
+a = None # type: A
+b = None # type: B
+class A: pass
+class B(A): pass
+assert_type(d, Any)
+assert_type(a, A)
+assert_type(b, B)
+[out]
+AssertTypeExpr(8) : Any
+NameExpr(8) : Any
+AssertTypeExpr(9) : A
+NameExpr(9) : A
+AssertTypeExpr(10) : B
+NameExpr(10) : B
 
 [case testArithmeticOps]
 ## OpExpr
@@ -246,10 +265,10 @@ elif not a:
 [builtins fixtures/bool.pyi]
 [out]
 NameExpr(3) : builtins.bool
-IntExpr(4) : builtins.int
-NameExpr(5) : builtins.bool
+IntExpr(4) : Literal[1]?
+NameExpr(5) : Literal[False]
 UnaryExpr(5) : builtins.bool
-IntExpr(6) : builtins.int
+IntExpr(6) : Literal[1]?
 
 [case testWhile]
 
@@ -259,7 +278,7 @@ while a:
 [builtins fixtures/bool.pyi]
 [out]
 NameExpr(3) : builtins.bool
-NameExpr(4) : builtins.bool
+NameExpr(4) : Literal[True]
 
 
 -- Simple type inference
@@ -715,7 +734,7 @@ NameExpr(2) : B
 import typing
 f = lambda: 1
 [out]
-LambdaExpr(3) : def () -> builtins.int
+LambdaExpr(3) : def () -> Literal[1]?
 NameExpr(3) : def () -> builtins.int
 
 [case testLambdaWithInferredType2]
@@ -727,7 +746,7 @@ f = lambda: [1]
 LambdaExpr(3) : def () -> builtins.list[builtins.int]
 NameExpr(3) : def () -> builtins.list[builtins.int]
 
-[case testLambdaWithInferredType2]
+[case testLambdaWithInferredType3]
 from typing import List, Callable
 f = lambda x: [] # type: Callable[[B], List[A]]
 class A: pass
@@ -893,7 +912,7 @@ class A:
     def f(self): pass
 A.f
 [out]
-MemberExpr(5) : def (self: Any) -> Any
+MemberExpr(5) : def (self: A) -> Any
 
 [case testOverloadedUnboundMethod]
 ## MemberExpr
@@ -906,6 +925,7 @@ class A:
 
     def f(self, *args) -> None: pass
 A.f
+[builtins fixtures/tuple.pyi]
 [out]
 MemberExpr(10) : Overload(def (self: A), def (self: A, builtins.object))
 
@@ -920,8 +940,9 @@ class A:
 
     def f(self, *args): pass
 A.f
+[builtins fixtures/tuple.pyi]
 [out]
-MemberExpr(10) : Overload(def (self: Any) -> Any, def (self: Any, Any) -> Any)
+MemberExpr(10) : Overload(def (self: A) -> Any, def (self: A, Any) -> Any)
 
 [case testUnboundMethodWithInheritance]
 ## MemberExpr
@@ -974,6 +995,7 @@ class A(Generic[t]):
 
 ab, b = None, None # type: (A[B], B)
 A.f(ab, b)
+[builtins fixtures/tuple.pyi]
 [out]
 CallExpr(13) : B
 
@@ -986,7 +1008,7 @@ class A(Generic[t]):
     def f(self, x): pass
 A.f(None, None)
 [out]
-MemberExpr(7) : def (self: Any, x: Any) -> Any
+MemberExpr(7) : def (self: A[t`1], x: Any) -> Any
 
 [case testGenericMethodOfGenericClass]
 ## MemberExpr
@@ -1117,7 +1139,7 @@ m(fun,
   nums)
 [builtins fixtures/list.pyi]
 [out]
-IntExpr(13) : builtins.int
+IntExpr(13) : Literal[1]?
 ListExpr(13) : builtins.list[builtins.int]
 CallExpr(14) : None
 NameExpr(14) : def (s: builtins.int) -> builtins.int
@@ -1146,18 +1168,56 @@ from typing import List
 a = [None] * 3 # type: List[str]
 [builtins fixtures/list.pyi]
 [out]
-IntExpr(3) : builtins.int
+IntExpr(3) : Literal[3]?
 ListExpr(3) : builtins.list[builtins.str]
 OpExpr(3) : builtins.list[builtins.str]
 
 [case testStringFormatting]
-## .*
+## IntExpr|OpExpr|StrExpr
 '%d' % 1
 [builtins fixtures/primitives.pyi]
+[typing fixtures/typing-medium.pyi]
 [out]
-IntExpr(2) : builtins.int
+IntExpr(2) : Literal[1]?
 OpExpr(2) : builtins.str
-StrExpr(2) : builtins.str
+StrExpr(2) : Literal['%d']?
+
+[case testExportOverloadArgType]
+## LambdaExpr|NameExpr
+from typing import List, overload, Callable
+@overload
+def f(x: int, f: Callable[[int], int]) -> None: ...
+@overload
+def f(x: str, f: Callable[[str], str]) -> None: ...
+def f(x): ...
+f(
+    1, lambda x: x)
+[builtins fixtures/list.pyi]
+[out]
+NameExpr(8) : Overload(def (x: builtins.int, f: def (builtins.int) -> builtins.int), def (x: builtins.str, f: def (builtins.str) -> builtins.str))
+LambdaExpr(9) : def (builtins.int) -> builtins.int
+NameExpr(9) : builtins.int
+
+[case testExportOverloadArgTypeNested]
+## LambdaExpr
+from typing import overload, Callable
+@overload
+def f(x: int, f: Callable[[int], int]) -> int: ...
+@overload
+def f(x: str, f: Callable[[str], str]) -> str: ...
+def f(x): ...
+f(
+    f(1, lambda y: y),
+    lambda x: x)
+f(
+    f('x', lambda y: y),
+    lambda x: x)
+[builtins fixtures/list.pyi]
+[out]
+LambdaExpr(9) : def (builtins.int) -> builtins.int
+LambdaExpr(10) : def (builtins.int) -> builtins.int
+LambdaExpr(12) : def (builtins.str) -> builtins.str
+LambdaExpr(13) : def (builtins.str) -> builtins.str
 
 -- TODO
 --
@@ -1170,7 +1230,6 @@ StrExpr(2) : builtins.str
 --   more complex lambda (multiple arguments etc.)
 --   list comprehension
 --   generator expression
--- overloads
 -- other things
 --   type inference
 --   default argument value

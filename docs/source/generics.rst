@@ -2,7 +2,7 @@ Generics
 ========
 
 This section explains how you can define your own generic classes that take
-one or more type parameters, similar to built-in types such as ``List[X]``.
+one or more type parameters, similar to built-in types such as ``list[X]``.
 User-defined generics are a moderately advanced feature and you can get far
 without ever using them -- feel free to skip this section and come back later.
 
@@ -13,8 +13,8 @@ Defining generic classes
 
 The built-in collection classes are generic classes. Generic types
 have one or more type parameters, which can be arbitrary types. For
-example, ``Dict[int, str]`` has the type parameters ``int`` and
-``str``, and ``List[int]`` has a type parameter ``int``.
+example, ``dict[int, str]`` has the type parameters ``int`` and
+``str``, and ``list[int]`` has a type parameter ``int``.
 
 Programs can also define new generic classes. Here is a very simple
 generic class that represents a stack:
@@ -28,7 +28,7 @@ generic class that represents a stack:
    class Stack(Generic[T]):
        def __init__(self) -> None:
            # Create an empty list with items of type T
-           self.items: List[T] = []
+           self.items: list[T] = []
 
        def push(self, item: T) -> None:
            self.items.append(item)
@@ -40,7 +40,7 @@ generic class that represents a stack:
            return not self.items
 
 The ``Stack`` class can be used to represent a stack of any type:
-``Stack[int]``, ``Stack[Tuple[int, str]]``, etc.
+``Stack[int]``, ``Stack[tuple[int, str]]``, etc.
 
 Using ``Stack`` is similar to built-in container types:
 
@@ -77,52 +77,77 @@ Generic class internals
 ***********************
 
 You may wonder what happens at runtime when you index
-``Stack``. Actually, indexing ``Stack`` returns essentially a copy
-of ``Stack`` that returns instances of the original class on
+``Stack``. Indexing ``Stack`` returns a *generic alias*
+to ``Stack`` that returns instances of the original class on
 instantiation:
 
->>> print(Stack)
-__main__.Stack
->>> print(Stack[int])
-__main__.Stack[int]
->>> print(Stack[int]().__class__)
-__main__.Stack
+.. code-block:: python
 
-Note that built-in types ``list``, ``dict`` and so on do not support
-indexing in Python. This is why we have the aliases ``List``, ``Dict``
-and so on in the ``typing`` module. Indexing these aliases gives
-you a class that directly inherits from the target class in Python:
+   >>> print(Stack)
+   __main__.Stack
+   >>> print(Stack[int])
+   __main__.Stack[int]
+   >>> print(Stack[int]().__class__)
+   __main__.Stack
 
->>> from typing import List
->>> List[int]
-typing.List[int]
->>> List[int].__bases__
-(<class 'list'>, typing.MutableSequence)
-
-Generic types could be instantiated or subclassed as usual classes,
-but the above examples illustrate that type variables are erased at
-runtime. Generic ``Stack`` instances are just ordinary
+Generic aliases can be instantiated or subclassed, similar to real
+classes, but the above examples illustrate that type variables are
+erased at runtime. Generic ``Stack`` instances are just ordinary
 Python objects, and they have no extra runtime overhead or magic due
 to being generic, other than a metaclass that overloads the indexing
 operator.
+
+Note that in Python 3.8 and lower, the built-in types
+:py:class:`list`, :py:class:`dict` and others do not support indexing.
+This is why we have the aliases :py:class:`~typing.List`,
+:py:class:`~typing.Dict` and so on in the :py:mod:`typing`
+module. Indexing these aliases gives you a generic alias that
+resembles generic aliases constructed by directly indexing the target
+class in more recent versions of Python:
+
+.. code-block:: python
+
+   >>> # Only relevant for Python 3.8 and below
+   >>> # For Python 3.9 onwards, prefer `list[int]` syntax
+   >>> from typing import List
+   >>> List[int]
+   typing.List[int]
+
+Note that the generic aliases in ``typing`` don't support constructing
+instances:
+
+.. code-block:: python
+
+   >>> from typing import List
+   >>> List[int]()
+   Traceback (most recent call last):
+   ...
+   TypeError: Type List cannot be instantiated; use list() instead
+
+.. note::
+
+   In Python 3.6 indexing generic types or type aliases results in actual
+   type objects. This means that generic types in type annotations can
+   have a significant runtime cost. This was changed in Python 3.7, and
+   indexing generic types became a cheap operation.
 
 .. _generic-subclasses:
 
 Defining sub-classes of generic classes
 ***************************************
 
-User-defined generic classes and generic classes defined in ``typing``
+User-defined generic classes and generic classes defined in :py:mod:`typing`
 can be used as base classes for another classes, both generic and
 non-generic. For example:
 
 .. code-block:: python
 
-   from typing import Generic, TypeVar, Mapping, Iterator, Dict
+   from typing import Generic, TypeVar, Mapping, Iterator
 
    KT = TypeVar('KT')
    VT = TypeVar('VT')
 
-   class MyMap(Mapping[KT, VT]]):  # This is a generic subclass of Mapping
+   class MyMap(Mapping[KT, VT]):  # This is a generic subclass of Mapping
        def __getitem__(self, k: KT) -> VT:
            ...  # Implementations omitted
        def __iter__(self) -> Iterator[KT]:
@@ -132,9 +157,9 @@ non-generic. For example:
 
    items: MyMap[str, int]  # Okay
 
-   class StrDict(Dict[str, str]):  # This is a non-generic subclass of Dict
+   class StrDict(dict[str, str]):  # This is a non-generic subclass of dict
        def __str__(self) -> str:
-           return 'StrDict({})'.format(super().__str__())
+           return f'StrDict({super().__str__()})'
 
    data: StrDict[int, int]  # Error! StrDict is not generic
    data2: StrDict  # OK
@@ -148,13 +173,13 @@ non-generic. For example:
 
 .. note::
 
-    You have to add an explicit ``Mapping`` base class
+    You have to add an explicit :py:class:`~typing.Mapping` base class
     if you want mypy to consider a user-defined class as a mapping (and
-    ``Sequence`` for sequences, etc.). This is because mypy doesn't use
+    :py:class:`~typing.Sequence` for sequences, etc.). This is because mypy doesn't use
     *structural subtyping* for these ABCs, unlike simpler protocols
-    like ``Iterable``, which use :ref:`structural subtyping <protocol-types>`.
+    like :py:class:`~typing.Iterable`, which use :ref:`structural subtyping <protocol-types>`.
 
-``Generic[...]`` can be omitted from bases if there are
+:py:class:`Generic <typing.Generic>` can be omitted from bases if there are
 other base classes that include type variables, such as ``Mapping[KT, VT]``
 in the above example. If you include ``Generic[...]`` in bases, then
 it should list all type variables present in other bases (or more,
@@ -239,15 +264,8 @@ Generic methods and generic self
 You can also define generic methods — just use a type variable in the
 method signature that is different from class type variables. In particular,
 ``self`` may also be generic, allowing a method to return the most precise
-type known at the point of access.
-
-.. note::
-
-   This feature is experimental. Checking code with type annotations for self
-   arguments is still not fully implemented. Mypy may disallow valid code or
-   allow unsafe code.
-
-In this way, for example, you can typecheck chaining of setter methods:
+type known at the point of access. In this way, for example, you can typecheck
+chaining of setter methods:
 
 .. code-block:: python
 
@@ -270,25 +288,25 @@ In this way, for example, you can typecheck chaining of setter methods:
            self.width = w
            return self
 
-   circle = Circle().set_scale(0.5).set_radius(2.7)  # type: Circle
-   square = Square().set_scale(0.5).set_width(3.2)  # type: Square
+   circle: Circle = Circle().set_scale(0.5).set_radius(2.7)
+   square: Square = Square().set_scale(0.5).set_width(3.2)
 
 Without using generic ``self``, the last two lines could not be type-checked properly.
 
 Other uses are factory methods, such as copy and deserialization.
-For class methods, you can also define generic ``cls``, using ``Type[T]``:
+For class methods, you can also define generic ``cls``, using :py:class:`Type[T] <typing.Type>`:
 
 .. code-block:: python
 
-   from typing import TypeVar, Tuple, Type
+   from typing import TypeVar, Type
 
    T = TypeVar('T', bound='Friend')
 
    class Friend:
-       other = None  # type: Friend
+       other: "Friend" = None
 
        @classmethod
-       def make_pair(cls: Type[T]) -> Tuple[T, T]:
+       def make_pair(cls: Type[T]) -> tuple[T, T]:
            a, b = cls(), cls()
            a.other = b
            b.other = a
@@ -307,6 +325,69 @@ Note also that mypy cannot always verify that the implementation of a copy
 or a deserialization method returns the actual type of self. Therefore
 you may need to silence mypy inside these methods (but not at the call site),
 possibly by making use of the ``Any`` type.
+
+Note that this feature may accept some unsafe code for the purpose of
+*practicality*. For example:
+
+.. code-block:: python
+
+   from typing import TypeVar
+
+   T = TypeVar("T")
+   class Base:
+       def compare(self: T, other: T) -> bool:
+           return False
+
+   class Sub(Base):
+       def __init__(self, x: int) -> None:
+           self.x = x
+
+       # This is unsafe (see below), but allowed because it is
+       # a common pattern, and rarely causes issues in practice.
+       def compare(self, other: Sub) -> bool:
+           return self.x > other.x
+
+   b: Base = Sub(42)
+   b.compare(Base())  # Runtime error here: 'Base' object has no attribute 'x'
+
+For some advanced uses of self-types see :ref:`additional examples <advanced_self>`.
+
+Automatic self types using typing.Self
+**************************************
+
+The patterns described above are quite common, so there is a syntactic sugar
+for them introduced in :pep:`673`. Instead of defining a type variable and
+using an explicit ``self`` annotation, you can import a magic type ``typing.Self``
+that is automatically transformed into a type variable with an upper bound of
+current class, and you don't need an annotation for ``self`` (or ``cls`` for
+class methods). The above example can thus be rewritten as:
+
+.. code-block:: python
+
+   from typing import Self
+
+   class Friend:
+       other: Self | None = None
+
+       @classmethod
+       def make_pair(cls) -> tuple[Self, Self]:
+           a, b = cls(), cls()
+           a.other = b
+           b.other = a
+           return a, b
+
+   class SuperFriend(Friend):
+       pass
+
+   a, b = SuperFriend.make_pair()
+
+This is more compact than using explicit type variables, plus additionally
+you can use ``Self`` in attribute annotations, not just in methods.
+
+.. note::
+
+   To use this feature on versions of Python before 3.11, you will need to
+   import ``Self`` from ``typing_extensions`` version 4.0 or newer.
 
 .. _variance-of-generics:
 
@@ -328,24 +409,24 @@ a subtype of ``A``, these are defined as follows:
 
 Let us illustrate this by few simple examples:
 
-* ``Union`` is covariant in all variables: ``Union[Cat, int]`` is a subtype
+* :py:data:`~typing.Union` is covariant in all variables: ``Union[Cat, int]`` is a subtype
   of ``Union[Animal, int]``,
   ``Union[Dog, int]`` is also a subtype of ``Union[Animal, int]``, etc.
-  Most immutable containers such as ``Sequence`` and ``FrozenSet`` are also
+  Most immutable containers such as :py:class:`~typing.Sequence` and :py:class:`~typing.FrozenSet` are also
   covariant.
-* ``Callable`` is an example of type that behaves contravariant in types of
+* :py:data:`~typing.Callable` is an example of type that behaves contravariant in types of
   arguments, namely ``Callable[[Employee], int]`` is a subtype of
   ``Callable[[Manager], int]``. To understand this, consider a function:
 
   .. code-block:: python
 
-     def salaries(staff: List[Manager],
-                  accountant: Callable[[Manager], int]) -> List[int]: ...
+     def salaries(staff: list[Manager],
+                  accountant: Callable[[Manager], int]) -> list[int]: ...
 
   This function needs a callable that can calculate a salary for managers, and
   if we give it a callable that can calculate a salary for an arbitrary
   employee, it's still safe.
-* ``List`` is an invariant generic type. Naively, one would think
+* :py:class:`~typing.List` is an invariant generic type. Naively, one would think
   that it is covariant, but let us consider this code:
 
   .. code-block:: python
@@ -357,14 +438,14 @@ Let us illustrate this by few simple examples:
          def rotate(self):
              ...
 
-     def add_one(things: List[Shape]) -> None:
+     def add_one(things: list[Shape]) -> None:
          things.append(Shape())
 
-     my_things: List[Circle] = []
+     my_things: list[Circle] = []
      add_one(my_things)     # This may appear safe, but...
      my_things[0].rotate()  # ...this will fail
 
-  Another example of invariant type is ``Dict``. Most mutable containers
+  Another example of invariant type is :py:class:`~typing.Dict`. Most mutable containers
   are invariant.
 
 By default, mypy assumes that all user-defined generics are invariant.
@@ -406,10 +487,10 @@ as its value. A typical example is a type variable that can only have values
 
    AnyStr = TypeVar('AnyStr', str, bytes)
 
-This is actually such a common type variable that ``AnyStr`` is
-defined in ``typing`` and we don't need to define it ourselves.
+This is actually such a common type variable that :py:data:`~typing.AnyStr` is
+defined in :py:mod:`typing` and we don't need to define it ourselves.
 
-We can use ``AnyStr`` to define a function that can concatenate
+We can use :py:data:`~typing.AnyStr` to define a function that can concatenate
 two strings or bytes objects, but it can't be called with other
 argument types:
 
@@ -447,7 +528,7 @@ subtype of ``str``:
 
     class S(str): pass
 
-    ss = concat(S('foo'), S('bar')))
+    ss = concat(S('foo'), S('bar'))
 
 You may expect that the type of ``ss`` is ``S``, but the type is
 actually ``str``: a subtype gets promoted to one of the valid values
@@ -462,9 +543,9 @@ this is correct for ``concat``, since ``concat`` actually returns a
     >>> print(type(ss))
     <class 'str'>
 
-You can also use a ``TypeVar`` with a restricted set of possible
+You can also use a :py:class:`~typing.TypeVar` with a restricted set of possible
 values when defining a generic class. For example, mypy uses the type
-``typing.Pattern[AnyStr]`` for the return value of ``re.compile``,
+:py:class:`Pattern[AnyStr] <typing.Pattern>` for the return value of :py:func:`re.compile`,
 since regular expressions can be based on a string or a bytes pattern.
 
 .. _type-variable-upper-bound:
@@ -475,7 +556,7 @@ Type variables with upper bounds
 A type variable can also be restricted to having values that are
 subtypes of a specific type. This type is called the upper bound of
 the type variable, and is specified with the ``bound=...`` keyword
-argument to ``TypeVar``.
+argument to :py:class:`~typing.TypeVar`.
 
 .. code-block:: python
 
@@ -514,16 +595,49 @@ A type variable may not have both a value restriction (see
 Declaring decorators
 ********************
 
-One common application of type variable upper bounds is in declaring a
-decorator that preserves the signature of the function it decorates,
-regardless of that signature. Here's a complete example:
+One common application of type variables along with parameter specifications
+is in declaring a decorator that preserves the signature of the function it decorates.
+
+Note that class decorators are handled differently than function decorators in
+mypy: decorating a class does not erase its type, even if the decorator has
+incomplete type annotations.
+
+Suppose we have the following decorator, not type annotated yet,
+that preserves the original function's signature and merely prints the decorated function's name:
 
 .. code-block:: python
 
-   from typing import Any, Callable, TypeVar, Tuple, cast
+   def my_decorator(func):
+       def wrapper(*args, **kwds):
+           print("Calling", func)
+           return func(*args, **kwds)
+       return wrapper
 
-   FuncType = Callable[..., Any]
-   F = TypeVar('F', bound=FuncType)
+and we use it to decorate function ``add_forty_two``:
+
+.. code-block:: python
+
+   # A decorated function.
+   @my_decorator
+   def add_forty_two(value: int) -> int:
+       return value + 42
+
+   a = add_forty_two(3)
+
+Since ``my_decorator`` is not type-annotated, the following won't get type-checked:
+
+.. code-block:: python
+
+   reveal_type(a)  # revealed type: Any
+   add_forty_two('foo')  # no type-checker error :(
+
+Before parameter specifications, here's how one might have annotated the decorator:
+
+.. code-block:: python
+
+   from typing import Any, Callable, TypeVar, cast
+
+   F = TypeVar('F', bound=Callable[..., Any])
 
    # A decorator that preserves the signature.
    def my_decorator(func: F) -> F:
@@ -532,40 +646,117 @@ regardless of that signature. Here's a complete example:
            return func(*args, **kwds)
        return cast(F, wrapper)
 
-   # A decorated function.
-   @my_decorator
-   def foo(a: int) -> str:
-       return str(a)
+and that would enable the following type checks:
 
-   # Another.
-   @my_decorator
-   def bar(x: float, y: float) -> Tuple[float, float, bool]:
-       return (x, y, x > y)
+.. code-block:: python
 
-   a = foo(12)
-   reveal_type(a)  # str
-   b = bar(3.14, 0)
-   reveal_type(b)  # Tuple[float, float, bool]
-   foo('x')    # Type check error: incompatible type "str"; expected "int"
+   reveal_type(a)  # Revealed type is "builtins.int"
+   add_forty_two('x')  # Argument 1 to "add_forty_two" has incompatible type "str"; expected "int"
 
-From the final block we see that the signatures of the decorated
-functions ``foo()`` and ``bar()`` are the same as those of the original
-functions (before the decorator is applied).
 
-The bound on ``F`` is used so that calling the decorator on a
-non-function (e.g. ``my_decorator(1)``) will be rejected.
-
-Also note that the ``wrapper()`` function is not type-checked. Wrapper
+Note that the ``wrapper()`` function is not type-checked. Wrapper
 functions are typically small enough that this is not a big
-problem. This is also the reason for the ``cast()`` call in the
-``return`` statement in ``my_decorator()``. See :ref:`casts`.
+problem. This is also the reason for the :py:func:`~typing.cast` call in the
+``return`` statement in ``my_decorator()``. See :ref:`casts <casts>`.  However,
+with the introduction of parameter specifications in mypy 0.940, we can now
+have a more faithful type annotation:
+
+.. code-block:: python
+
+   from typing import Callable, ParamSpec, TypeVar
+
+   P = ParamSpec('P')
+   T = TypeVar('T')
+
+   def my_decorator(func: Callable[P, T]) -> Callable[P, T]:
+       def wrapper(*args: P.args, **kwds: P.kwargs) -> T:
+           print("Calling", func)
+           return func(*args, **kwds)
+       return wrapper
+
+When the decorator alters the signature, parameter specifications truly show their potential:
+
+.. code-block:: python
+
+   from typing import Callable, ParamSpec, TypeVar
+
+   P = ParamSpec('P')
+   T = TypeVar('T')
+
+    # Note: We reuse 'P' in the return type, but replace 'T' with 'str'
+   def stringify(func: Callable[P, T]) -> Callable[P, str]:
+       def wrapper(*args: P.args, **kwds: P.kwargs) -> str:
+           return str(func(*args, **kwds))
+       return wrapper
+
+    @stringify
+    def add_forty_two(value: int) -> int:
+        return value + 42
+
+    a = add_forty_two(3)
+    reveal_type(a)  # str
+    foo('x')    # Type check error: incompatible type "str"; expected "int"
+
+
+.. _decorator-factories:
+
+Decorator factories
+-------------------
+
+Functions that take arguments and return a decorator (also called second-order decorators), are
+similarly supported via generics:
+
+.. code-block:: python
+
+    from typing import Any, Callable, TypeVar
+
+    F = TypeVar('F', bound=Callable[..., Any])
+
+    def route(url: str) -> Callable[[F], F]:
+        ...
+
+    @route(url='/')
+    def index(request: Any) -> str:
+        return 'Hello world'
+
+Sometimes the same decorator supports both bare calls and calls with arguments. This can be
+achieved by combining with :py:func:`@overload <typing.overload>`:
+
+.. code-block:: python
+
+    from typing import Any, Callable, Optional, TypeVar, overload
+
+    F = TypeVar('F', bound=Callable[..., Any])
+
+    # Bare decorator usage
+    @overload
+    def atomic(__func: F) -> F: ...
+    # Decorator with arguments
+    @overload
+    def atomic(*, savepoint: bool = True) -> Callable[[F], F]: ...
+
+    # Implementation
+    def atomic(__func: Optional[Callable[..., Any]] = None, *, savepoint: bool = True):
+        def decorator(func: Callable[..., Any]):
+            ...  # Code goes here
+        if __func is not None:
+            return decorator(__func)
+        else:
+            return decorator
+
+    # Usage
+    @atomic
+    def func1() -> None: ...
+
+    @atomic(savepoint=False)
+    def func2() -> None: ...
 
 Generic protocols
 *****************
 
 Mypy supports generic protocols (see also :ref:`protocol-types`). Several
 :ref:`predefined protocols <predefined_protocols>` are generic, such as
-``Iterable[T]``, and you can define additional generic protocols. Generic
+:py:class:`Iterable[T] <typing.Iterable>`, and you can define additional generic protocols. Generic
 protocols mostly follow the normal rules for generic classes. Example:
 
 .. code-block:: python
@@ -594,6 +785,10 @@ protocols mostly follow the normal rules for generic classes. Example:
    x: Box[float] = ...
    y: Box[int] = ...
    x = y  # Error -- Box is invariant
+
+Per :pep:`PEP 544: Generic protocols <544#generic-protocols>`, ``class
+ClassName(Protocol[T])`` is allowed as a shorthand for ``class
+ClassName(Protocol, Generic[T])``.
 
 The main difference between generic protocols and ordinary generic
 classes is that mypy checks that the declared variances of generic
@@ -662,16 +857,16 @@ Type aliases can be generic. In this case they can be used in two ways:
 Subscripted aliases are equivalent to original types with substituted type
 variables, so the number of type arguments must match the number of free type variables
 in the generic type alias. Unsubscripted aliases are treated as original types with free
-variables replaced with ``Any``. Examples (following `PEP 484
-<https://www.python.org/dev/peps/pep-0484/#type-aliases>`_):
+variables replaced with ``Any``. Examples (following :pep:`PEP 484: Type aliases
+<484#type-aliases>`):
 
 .. code-block:: python
 
-    from typing import TypeVar, Iterable, Tuple, Union, Callable
+    from typing import TypeVar, Iterable, Union, Callable
 
     S = TypeVar('S')
 
-    TInt = Tuple[int, S]
+    TInt = tuple[int, S]
     UInt = Union[S, int]
     CBack = Callable[..., S]
 
@@ -679,11 +874,11 @@ variables replaced with ``Any``. Examples (following `PEP 484
         ...
     def activate(cb: CBack[S]) -> S:        # Same as Callable[..., S]
         ...
-    table_entry: TInt  # Same as Tuple[int, Any]
+    table_entry: TInt  # Same as tuple[int, Any]
 
     T = TypeVar('T', int, float, complex)
 
-    Vec = Iterable[Tuple[T, T]]
+    Vec = Iterable[tuple[T, T]]
 
     def inproduct(v: Vec[T]) -> T:
         return sum(x*y for x, y in v)
@@ -691,8 +886,8 @@ variables replaced with ``Any``. Examples (following `PEP 484
     def dilate(v: Vec[T], scale: T) -> Vec[T]:
         return ((x * scale, y * scale) for x, y in v)
 
-    v1: Vec[int] = []      # Same as Iterable[Tuple[int, int]]
-    v2: Vec = []           # Same as Iterable[Tuple[Any, Any]]
+    v1: Vec[int] = []      # Same as Iterable[tuple[int, int]]
+    v2: Vec = []           # Same as Iterable[tuple[Any, Any]]
     v3: Vec[int, int] = [] # Error: Invalid alias, too many type arguments!
 
 Type aliases can be imported from modules just like other names. An
@@ -721,9 +916,5 @@ defeating the purpose of using aliases.  Example:
 
     OIntVec = Optional[Vec[int]]
 
-.. note::
-
-    A type alias does not define a new type. For generic type aliases
-    this means that variance of type variables used for alias definition does not
-    apply to aliases. A parameterized generic alias is treated simply as an original
-    type with the corresponding type variables substituted.
+Using type variable bounds or values in generic aliases, has the same effect
+as in generic classes/functions.

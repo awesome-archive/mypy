@@ -10,7 +10,11 @@ class type:
     def __init__(self, x) -> None: pass
 
 class function: pass
+class classmethod: pass
+
 class ellipsis: pass
+EllipsisType = ellipsis
+Ellipsis = ellipsis()
 
 def isinstance(x: object, t: Union[type, Tuple]) -> bool: pass
 def issubclass(x: object, t: Union[type, Tuple]) -> bool: pass
@@ -37,6 +41,8 @@ class list(Sequence[T]):
     def __getitem__(self, x: int) -> T: pass
     def __add__(self, x: List[T]) -> T: pass
     def __contains__(self, item: object) -> bool: pass
+    def append(self, x: T) -> None: pass
+    def extend(self, x: Iterable[T]) -> None: pass
 
 class dict(Mapping[KT, VT]):
     @overload

@@ -21,7 +21,56 @@ def f() -> None: pass
 ==
 a.py:1: error: invalid syntax
 ==
-main:2: error: Too few arguments for "f"
+main:2: error: Missing positional argument "x" in call to "f"
+==
+[out version>=3.10]
+==
+a.py:1: error: expected ':'
+==
+main:2: error: Missing positional argument "x" in call to "f"
+==
+
+[case testParseErrorShowSource]
+# flags: --pretty --show-error-codes
+import a
+a.f()
+[file a.py]
+def f() -> None: pass
+[file a.py.2]
+def f(x: int) ->
+[file a.py.3]
+def f(x: int) -> None: pass
+[file a.py.4]
+def f() -> None: pass
+[out]
+==
+a.py:1: error: invalid syntax  [syntax]
+    def f(x: int) ->
+                    ^
+==
+main:3: error: Missing positional argument "x" in call to "f"  [call-arg]
+    a.f()
+    ^
+==
+[out version>=3.8]
+==
+a.py:1: error: invalid syntax  [syntax]
+    def f(x: int) ->
+                    ^
+==
+main:3: error: Missing positional argument "x" in call to "f"  [call-arg]
+    a.f()
+    ^~~~~
+==
+[out version>=3.10]
+==
+a.py:1: error: expected ':'  [syntax]
+    def f(x: int) ->
+                   ^
+==
+main:3: error: Missing positional argument "x" in call to "f"  [call-arg]
+    a.f()
+    ^~~~~
 ==
 
 [case testParseErrorMultipleTimes]
@@ -42,7 +91,14 @@ a.py:1: error: invalid syntax
 ==
 a.py:2: error: invalid syntax
 ==
-main:2: error: Too few arguments for "f"
+main:2: error: Missing positional argument "x" in call to "f"
+[out version>=3.10]
+==
+a.py:1: error: expected ':'
+==
+a.py:2: error: expected ':'
+==
+main:2: error: Missing positional argument "x" in call to "f"
 
 [case testSemanticAnalysisBlockingError]
 import a
@@ -56,9 +112,9 @@ break
 def f(x: int) -> None: pass
 [out]
 ==
-a.py:2: error: 'break' outside loop
+a.py:2: error: "break" outside loop
 ==
-main:2: error: Too few arguments for "f"
+main:2: error: Missing positional argument "x" in call to "f"
 
 [case testBlockingErrorWithPreviousError]
 import a
@@ -82,6 +138,14 @@ a.py:1: error: invalid syntax
 ==
 main:3: error: Too many arguments for "f"
 main:5: error: Too many arguments for "f"
+[out version>=3.10]
+main:3: error: Too many arguments for "f"
+main:5: error: Too many arguments for "f"
+==
+a.py:1: error: expected ':'
+==
+main:3: error: Too many arguments for "f"
+main:5: error: Too many arguments for "f"
 
 [case testUpdateClassReferenceAcrossBlockingError]
 import a
@@ -101,7 +165,12 @@ class C:
 ==
 a.py:1: error: invalid syntax
 ==
-main:5: error: Too few arguments for "f" of "C"
+main:5: error: Missing positional argument "x" in call to "f" of "C"
+[out version==3.10.0]
+==
+a.py:1: error: invalid syntax. Perhaps you forgot a comma?
+==
+main:5: error: Missing positional argument "x" in call to "f" of "C"
 
 [case testAddFileWithBlockingError]
 import a
@@ -111,10 +180,17 @@ x x
 [file a.py.3]
 def f() -> None: pass
 [out]
-main:1: error: Cannot find module named 'a'
-main:1: note: See https://mypy.readthedocs.io/en/latest/running_mypy.html#missing-imports
+main:1: error: Cannot find implementation or library stub for module named "a"
+main:1: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
 ==
 a.py:1: error: invalid syntax
+==
+main:2: error: Too many arguments for "f"
+[out version==3.10.0]
+main:1: error: Cannot find implementation or library stub for module named "a"
+main:1: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
+==
+a.py:1: error: invalid syntax. Perhaps you forgot a comma?
 ==
 main:2: error: Too many arguments for "f"
 
@@ -192,7 +268,14 @@ a.py:1: error: invalid syntax
 ==
 a.py:1: error: invalid syntax
 ==
-a.py:2: error: Too few arguments for "f"
+a.py:2: error: Missing positional argument "x" in call to "f"
+[out version==3.10.0]
+==
+a.py:1: error: invalid syntax. Perhaps you forgot a comma?
+==
+a.py:1: error: invalid syntax. Perhaps you forgot a comma?
+==
+a.py:2: error: Missing positional argument "x" in call to "f"
 
 [case testModifyTwoFilesIntroduceTwoBlockingErrors]
 import a
@@ -234,8 +317,8 @@ a.py:1: error: invalid syntax
 ==
 a.py:1: error: invalid syntax
 ==
-b.py:3: error: Too many arguments for "f"
 a.py:3: error: Too many arguments for "g"
+b.py:3: error: Too many arguments for "f"
 
 [case testDeleteFileWithBlockingError-only_when_nocache]
 -- Different cache/no-cache tests because:
@@ -254,11 +337,18 @@ x x
 ==
 a.py:1: error: invalid syntax
 ==
-main:1: error: Cannot find module named 'a'
-main:1: note: See https://mypy.readthedocs.io/en/latest/running_mypy.html#missing-imports
-b.py:1: error: Cannot find module named 'a'
+main:1: error: Cannot find implementation or library stub for module named "a"
+main:1: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
+b.py:1: error: Cannot find implementation or library stub for module named "a"
+[out version==3.10.0]
+==
+a.py:1: error: invalid syntax. Perhaps you forgot a comma?
+==
+main:1: error: Cannot find implementation or library stub for module named "a"
+main:1: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
+b.py:1: error: Cannot find implementation or library stub for module named "a"
 
-[case testDeleteFileWithBlockingError-only_when_cache]
+[case testDeleteFileWithBlockingError2-only_when_cache]
 -- Different cache/no-cache tests because:
 -- Error message ordering differs
 import a
@@ -275,9 +365,16 @@ x x
 ==
 a.py:1: error: invalid syntax
 ==
-b.py:1: error: Cannot find module named 'a'
-b.py:1: note: See https://mypy.readthedocs.io/en/latest/running_mypy.html#missing-imports
-main:1: error: Cannot find module named 'a'
+b.py:1: error: Cannot find implementation or library stub for module named "a"
+b.py:1: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
+main:1: error: Cannot find implementation or library stub for module named "a"
+[out version==3.10.0]
+==
+a.py:1: error: invalid syntax. Perhaps you forgot a comma?
+==
+b.py:1: error: Cannot find implementation or library stub for module named "a"
+b.py:1: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
+main:1: error: Cannot find implementation or library stub for module named "a"
 
 [case testModifyFileWhileBlockingErrorElsewhere]
 import a
@@ -301,6 +398,14 @@ a.py:1: error: invalid syntax
 ==
 b.py:2: error: Module has no attribute "f"
 b.py:3: error: "int" not callable
+[out version==3.10.0]
+==
+a.py:1: error: invalid syntax. Perhaps you forgot a comma?
+==
+a.py:1: error: invalid syntax. Perhaps you forgot a comma?
+==
+b.py:2: error: Module has no attribute "f"
+b.py:3: error: "int" not callable
 
 [case testImportBringsAnotherFileWithBlockingError1]
 import a
@@ -316,6 +421,11 @@ def f() -> None: pass
 <ROOT>/test-data/unit/lib-stub/blocker.pyi:2: error: invalid syntax
 ==
 a.py:1: error: "int" not callable
+[out version==3.10.0]
+==
+<ROOT>/test-data/unit/lib-stub/blocker.pyi:2: error: invalid syntax. Perhaps you forgot a comma?
+==
+a.py:1: error: "int" not callable
 
 [case testImportBringsAnotherFileWithSemanticAnalysisBlockingError]
 import a
@@ -327,7 +437,7 @@ import blocker2
 1()
 [out]
 ==
-<ROOT>/test-data/unit/lib-stub/blocker2.pyi:2: error: 'continue' outside loop
+<ROOT>/test-data/unit/lib-stub/blocker2.pyi:2: error: "continue" outside loop
 ==
 a.py:1: error: "int" not callable
 
@@ -348,8 +458,8 @@ class A: pass
 [builtins fixtures/module.pyi]
 [out]
 ==
-main:1: error: Cannot find module named 'a'
-main:1: note: See https://mypy.readthedocs.io/en/latest/running_mypy.html#missing-imports
+main:1: error: Cannot find implementation or library stub for module named "a"
+main:1: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
 ==
 main:4: error: "A" has no attribute "f"
 
@@ -366,10 +476,10 @@ class A:
 [builtins fixtures/module.pyi]
 [out]
 ==
-main:1: error: Cannot find module named 'a'
-main:1: note: See https://mypy.readthedocs.io/en/latest/running_mypy.html#missing-imports
+main:1: error: Cannot find implementation or library stub for module named "a"
+main:1: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
 ==
-main:1: error: Module 'a' has no attribute 'A'
+main:1: error: Module "a" has no attribute "A"
 
 [case testFixingBlockingErrorBringsInAnotherModuleWithBlocker]
 import a
@@ -382,11 +492,19 @@ import blocker
 [file a.py.4]
 import sys
 1()
+[builtins fixtures/tuple.pyi]
 [out]
 ==
 a.py:1: error: invalid syntax
 ==
 <ROOT>/test-data/unit/lib-stub/blocker.pyi:2: error: invalid syntax
+==
+a.py:2: error: "int" not callable
+[out version==3.10.0]
+==
+a.py:1: error: invalid syntax. Perhaps you forgot a comma?
+==
+<ROOT>/test-data/unit/lib-stub/blocker.pyi:2: error: invalid syntax. Perhaps you forgot a comma?
 ==
 a.py:2: error: "int" not callable
 
@@ -407,8 +525,13 @@ a.py:1: error: invalid syntax
 ==
 b.py:2: error: Incompatible return value type (got "str", expected "int")
 ==
+[out version==3.10.0]
+a.py:1: error: invalid syntax. Perhaps you forgot a comma?
+==
+b.py:2: error: Incompatible return value type (got "str", expected "int")
+==
 
-[case testDecodeErrorBlocker-posix]
+[case testDecodeErrorBlocker1-posix]
 import a
 a.f(1)
 [file a.py]
@@ -424,7 +547,7 @@ mypy: can't decode file 'tmp/a.py': 'ascii' codec can't decode byte 0xc3 in posi
 ==
 main:2: error: Argument 1 to "f" has incompatible type "int"; expected "str"
 
-[case testDecodeErrorBlocker-windows]
+[case testDecodeErrorBlocker2-windows]
 import a
 a.f(1)
 [file a.py]
@@ -439,26 +562,6 @@ def f(x: str) -> None: ...
 mypy: can't decode file 'tmp/a.py': 'ascii' codec can't decode byte 0xc3 in position 17: ordinal not in range(128)
 ==
 main:2: error: Argument 1 to "f" has incompatible type "int"; expected "str"
-
-[case testDecodeErrorBlocker_python2-only_when_nocache]
-# flags: --py2
-import a
-a.f(1)
-[file a.py]
-def f(x):
-    # type: (int) -> None
-    pass
-[file a.py.2]
-ä = 1
-[file a.py.3]
-def f(x):
-    # type: (str) -> None
-    pass
-[out]
-==
-mypy: can't decode file 'tmp/a.py': 'ascii' codec can't decode byte 0xc3 in position 0: ordinal not in range(128)
-==
-main:3: error: Argument 1 to "f" has incompatible type "int"; expected "str"
 
 [case testDecodeErrorBlockerOnInitialRun-posix]
 # Note that there's no test variant for Windows, since the above Windows test case is good enough.

@@ -3,14 +3,14 @@
 Metaclasses
 ===========
 
-A `metaclass <https://docs.python.org/3/reference/datamodel.html#metaclasses>`_
-is a class that describes the construction and behavior of other classes,
-similarly to how classes describe the construction and behavior of objects.
-The default metaclass is ``type``, but it's possible to use other metaclasses.
-Metaclasses allows one to create "a different kind of class", such as Enums,
-NamedTuples and singletons.
+A :ref:`metaclass <python:metaclasses>` is a class that describes
+the construction and behavior of other classes, similarly to how classes
+describe the construction and behavior of objects.
+The default metaclass is :py:class:`type`, but it's possible to use other metaclasses.
+Metaclasses allows one to create "a different kind of class", such as
+:py:class:`~enum.Enum`\s, :py:class:`~typing.NamedTuple`\s and singletons.
 
-Mypy has some special understanding of ``ABCMeta`` and ``EnumMeta``.
+Mypy has some special understanding of :py:class:`~abc.ABCMeta` and ``EnumMeta``.
 
 .. _defining:
 
@@ -23,27 +23,6 @@ Defining a metaclass
         pass
 
     class A(metaclass=M):
-        pass
-
-In Python 2, the syntax for defining a metaclass is different:
-
-.. code-block:: python
-
-    class A(object):
-        __metaclass__ = M
-
-Mypy also supports using the `six <https://pythonhosted.org/six/#six.with_metaclass>`_
-library to define metaclass in a portable way:
-
-.. code-block:: python
-
-    import six
-
-    class A(six.with_metaclass(M)):
-        pass
-
-    @six.add_metaclass(M)
-    class C(object):
         pass
 
 .. _examples:
@@ -93,14 +72,17 @@ so it's better not to combine metaclasses and class hierarchies:
     class A1(metaclass=M1): pass
     class A2(metaclass=M2): pass
 
-    class B1(A1, metaclass=M2): pass  # Mypy Error: Inconsistent metaclass structure for 'B1'
+    class B1(A1, metaclass=M2): pass  # Mypy Error: metaclass conflict
     # At runtime the above definition raises an exception
     # TypeError: metaclass conflict: the metaclass of a derived class must be a (non-strict) subclass of the metaclasses of all its bases
 
-    # Same runtime error as in B1, but mypy does not catch it yet
-    class B12(A1, A2): pass
+    class B12(A1, A2): pass  # Mypy Error: metaclass conflict
+
+    # This can be solved via a common metaclass subtype:
+    class CorrectMeta(M1, M2): pass
+    class B2(A1, A2, metaclass=CorrectMeta): pass  # OK, runtime is also OK
 
 * Mypy does not understand dynamically-computed metaclasses,
   such as ``class A(metaclass=f()): ...``
 * Mypy does not and cannot understand arbitrary metaclass code.
-* Mypy only recognizes subclasses of ``type`` as potential metaclasses.
+* Mypy only recognizes subclasses of :py:class:`type` as potential metaclasses.
